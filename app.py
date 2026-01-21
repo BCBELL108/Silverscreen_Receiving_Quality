@@ -1,9 +1,10 @@
 import streamlit as st
 import pandas as pd
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from sqlalchemy import text
 import plotly.express as px
 import plotly.graph_objects as go
+import uuid
 
 # =============================================================================
 # CONFIG
@@ -304,7 +305,6 @@ def fetch_tags_and_lines(start_date: date, end_date: date) -> tuple[pd.DataFrame
             params={"sd": start_date, "ed": end_date},
         )
 
-    # Normalize date types
     if not tags.empty:
         tags["date_found"] = pd.to_datetime(tags["date_found"])
         tags["date_entered"] = pd.to_datetime(tags["date_entered"])
@@ -330,9 +330,13 @@ def default_line():
         "item_description": "",
         "color": "",
         "size": "M",
-        "vendor_packing_slip_matches": "",  # Yes/No/blank UI value
+        "vendor_packing_slip_matches": "",
         "qty_short": None,
         "qty_heavy": None,
+
+        # pairing metadata
+        "pair_group": None,   # shared id across pair
+        "paired_role": None,  # "Short" or "Heavy" for paired lines
     }
 
 
@@ -342,6 +346,51 @@ def packing_slip_to_bool(val: str):
     if val == "No":
         return False
     return None
+
+
+def fmt_mmddyyyy(dt_series: pd.Series) -> pd.Series:
+    return pd.to_datetime(dt_series).dt.strftime("%m/%d/%Y")
+
+
+def split_short_heavy_into_pair(idx: int):
+    """
+    Converts a single "Short/Heavy" line into two linked lines:
+    - current line becomes "Short"
+    - inserts a new line beneath as "Heavy"
+    Copies shared fields (style/desc/color/packing slip), but size stays editable.
+    """
+    lines = st.session_state["lines"]
+    if idx < 0 or idx >= len(lines):
+        return
+
+    ln = lines[idx]
+
+    # If already paired, don't re-split
+    if ln.get("pair_group"):
+        ln["short_heavy_tag"] = ln.get("paired_role") or "Short"
+        return
+
+    group_id = str(uuid.uuid4())
+
+    # Current line becomes SHORT
+    ln["pair_group"] = group_id
+    ln["paired_role"] = "Short"
+    ln["short_heavy_tag"] = "Short"
+
+    # Insert HEAVY line beneath it
+    new_ln = default_line()
+    new_ln["pair_group"] = group_id
+    new_ln["paired_role"] = "Heavy"
+    new_ln["short_heavy_tag"] = "Heavy"
+
+    # Copy shared fields so user doesn't retype
+    new_ln["style_number"] = ln.get("style_number", "")
+    new_ln["item_description"] = ln.get("item_description", "")
+    new_ln["color"] = ln.get("color", "")
+    new_ln["vendor_packing_slip_matches"] = ln.get("vendor_packing_slip_matches", "")
+
+    # Size stays editable (L vs XL scenario)
+    lines.insert(idx + 1, new_ln)
 
 
 def validate_submission(header: dict, lines: list[dict]) -> list[str]:
@@ -366,6 +415,7 @@ def validate_submission(header: dict, lines: list[dict]) -> list[str]:
         errors.append("At least one SKU/problem line is required.")
         return errors
 
+    # Basic per-line required fields
     for i, ln in enumerate(lines, start=1):
         if not (ln.get("style_number", "").strip()):
             errors.append(f"Line {i}: STYLE# is required.")
@@ -385,12 +435,29 @@ def validate_submission(header: dict, lines: list[dict]) -> list[str]:
             if val is not None and val < 0:
                 errors.append(f"Line {i}: {field} cannot be negative.")
 
+    # Enforce paired completeness: each pair must include Short and Heavy with qtys
+    pairs: dict[str, list[dict]] = {}
+    for ln in lines:
+        pg = ln.get("pair_group")
+        if pg:
+            pairs.setdefault(pg, []).append(ln)
+
+    for pg, group_lines in pairs.items():
+        roles = {g.get("paired_role") for g in group_lines}
+        if roles != {"Short", "Heavy"}:
+            errors.append("A Short/Heavy entry must include BOTH a Short line and a Heavy line.")
+            continue
+
+        short_ln = [g for g in group_lines if g.get("paired_role") == "Short"][0]
+        heavy_ln = [g for g in group_lines if g.get("paired_role") == "Heavy"][0]
+
+        # Require qty > 0 for paired roles
+        if (short_ln.get("qty_short") in (None, 0)):
+            errors.append("Short line requires Qty Short > 0.")
+        if (heavy_ln.get("qty_heavy") in (None, 0)):
+            errors.append("Heavy line requires Qty Heavy > 0.")
+
     return errors
-
-
-def fmt_mmddyyyy(dt_series: pd.Series) -> pd.Series:
-    # expects datetime-like series
-    return pd.to_datetime(dt_series).dt.strftime("%m/%d/%Y")
 
 
 # =============================================================================
@@ -487,13 +554,39 @@ def main():
         for idx, ln in enumerate(st.session_state["lines"]):
             with st.container(border=True):
                 top = st.columns([2, 2, 2, 2, 1])
+
+                # Short/Heavy selector with automatic pairing behavior
                 with top[0]:
-                    ln["short_heavy_tag"] = st.selectbox(
-                        "Short/Heavy Tag (optional)",
-                        SHORT_HEAVY_OPTIONS,
-                        index=SHORT_HEAVY_OPTIONS.index(ln.get("short_heavy_tag", "")) if ln.get("short_heavy_tag", "") in SHORT_HEAVY_OPTIONS else 0,
-                        key=f"sh_{idx}",
-                    )
+                    sh_key = f"sh_{idx}"
+                    if sh_key not in st.session_state:
+                        st.session_state[sh_key] = ln.get("short_heavy_tag", "")
+
+                    def _on_sh_change(i=idx, key=sh_key):
+                        val = st.session_state[key]
+                        st.session_state["lines"][i]["short_heavy_tag"] = val
+
+                        if val == "Short/Heavy":
+                            split_short_heavy_into_pair(i)
+                            st.rerun()
+
+                    # For paired lines, lock selector to the role (Short or Heavy)
+                    if ln.get("pair_group") and ln.get("paired_role") in ("Short", "Heavy"):
+                        st.selectbox(
+                            "Short/Heavy Tag (paired)",
+                            SHORT_HEAVY_OPTIONS,
+                            index=SHORT_HEAVY_OPTIONS.index(ln["paired_role"]),
+                            key=f"sh_lock_{idx}",
+                            disabled=True,
+                        )
+                        ln["short_heavy_tag"] = ln["paired_role"]
+                    else:
+                        ln["short_heavy_tag"] = st.selectbox(
+                            "Short/Heavy Tag (optional)",
+                            SHORT_HEAVY_OPTIONS,
+                            key=sh_key,
+                            on_change=_on_sh_change,
+                        )
+
                 with top[1]:
                     ln["style_number"] = st.text_input("STYLE# *", value=ln.get("style_number", ""), key=f"style_{idx}")
                 with top[2]:
@@ -516,23 +609,48 @@ def main():
                         index=PACKING_SLIP_OPTIONS.index(ln.get("vendor_packing_slip_matches", "")) if ln.get("vendor_packing_slip_matches", "") in PACKING_SLIP_OPTIONS else 0,
                         key=f"ps_{idx}",
                     )
+
+                role = ln.get("paired_role")
+
+                # Qty inputs: role-specific for paired lines
                 with bottom[1]:
-                    ln["qty_short"] = st.number_input(
-                        "Qty Short (optional)",
-                        min_value=0,
-                        step=1,
-                        value=int(ln["qty_short"]) if ln.get("qty_short") is not None else 0,
-                        key=f"qtys_{idx}",
-                    )
+                    if role == "Short":
+                        ln["qty_short"] = st.number_input(
+                            "Qty Short (required)",
+                            min_value=0,
+                            step=1,
+                            value=int(ln["qty_short"]) if ln.get("qty_short") is not None else 0,
+                            key=f"qtys_{idx}",
+                        )
+                    else:
+                        ln["qty_short"] = st.number_input(
+                            "Qty Short (optional)",
+                            min_value=0,
+                            step=1,
+                            value=int(ln["qty_short"]) if ln.get("qty_short") is not None else 0,
+                            key=f"qtys_{idx}",
+                        )
+
                 with bottom[2]:
-                    ln["qty_heavy"] = st.number_input(
-                        "Qty Heavy (optional)",
-                        min_value=0,
-                        step=1,
-                        value=int(ln["qty_heavy"]) if ln.get("qty_heavy") is not None else 0,
-                        key=f"qtyh_{idx}",
-                    )
+                    if role == "Heavy":
+                        ln["qty_heavy"] = st.number_input(
+                            "Qty Heavy (required)",
+                            min_value=0,
+                            step=1,
+                            value=int(ln["qty_heavy"]) if ln.get("qty_heavy") is not None else 0,
+                            key=f"qtyh_{idx}",
+                        )
+                    else:
+                        ln["qty_heavy"] = st.number_input(
+                            "Qty Heavy (optional)",
+                            min_value=0,
+                            step=1,
+                            value=int(ln["qty_heavy"]) if ln.get("qty_heavy") is not None else 0,
+                            key=f"qtyh_{idx}",
+                        )
+
                 with bottom[3]:
+                    # If paired, removing one line only removes that line; (we can add "Remove pair" later if you want)
                     if st.button("Remove line", key=f"rm_{idx}", use_container_width=True):
                         st.session_state["lines"].pop(idx)
                         if len(st.session_state["lines"]) == 0:
@@ -574,15 +692,20 @@ def main():
             payload["qty_short"] = None if payload.get("qty_short", 0) == 0 else int(payload["qty_short"])
             payload["qty_heavy"] = None if payload.get("qty_heavy", 0) == 0 else int(payload["qty_heavy"])
 
+            # do not store pairing metadata in DB
+            payload.pop("pair_group", None)
+            payload.pop("paired_role", None)
+
             lines_payload.append(payload)
 
         if st.button("💾 Submit Problem Tag", type="primary", use_container_width=True):
-            errs = validate_submission(header, lines_payload)
+            errs = validate_submission(header, st.session_state["lines"])
             if errs:
                 st.error("Please fix the following before submitting:")
                 for e in errs:
                     st.write(f"- {e}")
             else:
+                # Validate uses session_state lines (with pair metadata); save uses cleaned payload
                 tag_id = save_problem_tag(
                     date_found=header["date_found"],
                     po_number=header["po_number"],
@@ -604,7 +727,6 @@ def main():
     elif menu == "📊 Analytics":
         st.header("Analytics")
 
-        # Filters
         customers_df = get_customers()
         customer_list = ["-- All --"] + customers_df["customer_name"].tolist()
 
@@ -622,7 +744,6 @@ def main():
         with p1:
             problem_filter = st.selectbox("Problem Type", ["-- All --"] + PROBLEM_TYPES, key="ana_prob")
         with p2:
-            # quick KPI basis for trend
             trend_basis = st.selectbox("Trend Basis", ["Total Lines (recommended)", "Total Tags"], key="ana_basis")
 
         tags, lines = fetch_tags_and_lines(start_date, end_date)
@@ -631,7 +752,6 @@ def main():
             st.warning("No data found for this date range.")
             return
 
-        # Apply filters to both tags and lines
         tags_f = tags.copy()
         lines_f = lines.copy()
 
@@ -651,7 +771,6 @@ def main():
             st.warning("No data found for the selected filters.")
             return
 
-        # KPIs
         st.markdown("### Key Metrics")
         k1, k2, k3, k4 = st.columns(4)
         with k1:
@@ -659,7 +778,6 @@ def main():
         with k2:
             st.metric("Total Lines", int(lines_f["id"].nunique()) if not lines_f.empty else 0)
         with k3:
-            # packing slip match rate (only for lines where it was answered)
             if lines_f.empty:
                 st.metric("Packing Slip Match Rate", "—")
             else:
@@ -670,7 +788,6 @@ def main():
                     rate = (answered["vendor_packing_slip_matches"] == True).mean() * 100.0
                     st.metric("Packing Slip Match Rate", f"{rate:.1f}%")
         with k4:
-            # short/heavy count
             if lines_f.empty:
                 st.metric("Short/Heavy Lines", "0")
             else:
@@ -679,12 +796,12 @@ def main():
 
         st.markdown("---")
 
-        # Monthly buckets (by date_found)
+        # Monthly buckets
         tags_f["production_month"] = tags_f["date_found"].dt.to_period("M").dt.to_timestamp()
         if not lines_f.empty:
             lines_f["production_month"] = lines_f["date_found"].dt.to_period("M").dt.to_timestamp()
 
-        # Trend line
+        # Trend
         st.markdown("### Trend Over Time (by Month)")
         if trend_basis.startswith("Total Tags"):
             monthly_trend = (
@@ -709,13 +826,7 @@ def main():
                 )
                 y_label = "Total Lines"
 
-        fig = px.line(
-            monthly_trend,
-            x="production_month",
-            y="total",
-            markers=True,
-            title=None,
-        )
+        fig = px.line(monthly_trend, x="production_month", y="total", markers=True, title=None)
         fig.update_layout(
             xaxis_title="Production Month",
             yaxis_title=y_label,
@@ -727,7 +838,7 @@ def main():
 
         st.markdown("---")
 
-        # Shorts vs Heavies stacked by month
+        # Shorts vs Heavies stacked
         st.markdown("### Shorts vs Heavies (Stacked by Month)")
         if lines_f.empty:
             st.info("No line-level data available to chart Shorts/Heavies.")
@@ -741,12 +852,11 @@ def main():
                 if val == "Heavy":
                     return (0, 1)
                 if val == "Short/Heavy":
+                    # should not occur with new rules, but keep safe
                     return (1, 1)
                 return (0, 0)
 
-            tmp[["short_count", "heavy_count"]] = tmp["short_heavy_norm"].apply(
-                lambda v: pd.Series(split_counts(v))
-            )
+            tmp[["short_count", "heavy_count"]] = tmp["short_heavy_norm"].apply(lambda v: pd.Series(split_counts(v)))
 
             monthly_sh = (
                 tmp.groupby("production_month", as_index=False)
@@ -881,4 +991,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
