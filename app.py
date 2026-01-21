@@ -65,6 +65,19 @@ def init_db():
             );
         """))
 
+
+        # Receiving daily actuals (baseline for error rates)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS receiving_daily_actuals (
+                id SERIAL PRIMARY KEY,
+                date_entered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                receiving_date DATE UNIQUE NOT NULL,
+                orders_received INTEGER NOT NULL,
+                estimated_units INTEGER NOT NULL,
+                author_name TEXT NOT NULL,
+                notes TEXT
+            );
+        """))
         # Problem tag header (one per submission)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS receiving_problem_tags (
@@ -188,6 +201,75 @@ def add_employee(employee_name: str) -> None:
             """),
             {"n": employee_name},
         )
+
+
+# =============================================================================
+# RECEIVING DAILY ACTUALS (baseline)
+# =============================================================================
+
+def save_daily_actuals(
+    *,
+    receiving_date: date,
+    orders_received: int,
+    estimated_units: int,
+    author_name: str,
+    notes: str = "",
+) -> int:
+    """Upserts one daily record (unique by receiving_date). Returns row id."""
+    eng = get_engine()
+    with eng.begin() as conn:
+        rec_id = conn.execute(
+            text("""
+                INSERT INTO receiving_daily_actuals (
+                    receiving_date, orders_received, estimated_units, author_name, notes
+                )
+                VALUES (
+                    :receiving_date, :orders_received, :estimated_units, :author_name, :notes
+                )
+                ON CONFLICT (receiving_date)
+                DO UPDATE SET
+                    orders_received = EXCLUDED.orders_received,
+                    estimated_units = EXCLUDED.estimated_units,
+                    author_name = EXCLUDED.author_name,
+                    notes = EXCLUDED.notes,
+                    date_entered = CURRENT_TIMESTAMP
+                RETURNING id;
+            """),
+            {
+                "receiving_date": receiving_date,
+                "orders_received": int(orders_received),
+                "estimated_units": int(estimated_units),
+                "author_name": author_name.strip(),
+                "notes": (notes or "").strip(),
+            },
+        ).scalar_one()
+    return int(rec_id)
+
+
+def fetch_daily_actuals(start_date: date, end_date: date) -> pd.DataFrame:
+    eng = get_engine()
+    with eng.connect() as conn:
+        df = pd.read_sql(
+            text("""
+                SELECT
+                    id,
+                    date_entered,
+                    receiving_date,
+                    orders_received,
+                    estimated_units,
+                    author_name,
+                    notes
+                FROM receiving_daily_actuals
+                WHERE receiving_date BETWEEN :sd AND :ed
+                ORDER BY receiving_date ASC;
+            """),
+            conn,
+            params={"sd": start_date, "ed": end_date},
+        )
+    if not df.empty:
+        df["receiving_date"] = pd.to_datetime(df["receiving_date"])
+        df["date_entered"] = pd.to_datetime(df["date_entered"])
+    return df
 
 
 def save_problem_tag(
@@ -492,6 +574,7 @@ def main():
             "",
             [
                 "📝 Problem Tag Submission",
+                "📦 Receiving Data",
                 "📊 Analytics",
                 "📋 View Submissions",
                 "👥 Manage Lists",
@@ -720,6 +803,81 @@ def main():
                 st.success(f"✅ Saved Problem Tag (ID: {tag_id})")
                 st.session_state["lines"] = [default_line()]
 
+
+    # -------------------------------------------------------------------------
+    # 2) RECEIVING DATA (DAILY ACTUALS / BASELINE)
+    # -------------------------------------------------------------------------
+    elif menu == "📦 Receiving Data":
+        st.header("Receiving Data (Daily Actuals)")
+
+        st.markdown(
+            "Use this page to log what Receiving completed each day so we have a baseline "
+            "for error rates (issues vs total orders/units received)."
+        )
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            receiving_date = st.date_input(
+                "Receiving Date *",
+                value=date.today() - timedelta(days=1),
+                format="MM/DD/YYYY",
+                help="Typically enter yesterday's totals.",
+            )
+        with c2:
+            orders_received = st.number_input("Total Orders Received *", min_value=0, step=1, value=0)
+        with c3:
+            estimated_units = st.number_input("Estimated Units Received *", min_value=0, step=1, value=0)
+
+        author_name = st.text_input("Submitted By *", placeholder="Type name...")
+        notes = st.text_area("Notes (optional)", placeholder="Anything helpful (carrier delays, partial deliveries, etc.)")
+
+        if st.button("💾 Save Receiving Data", type="primary", use_container_width=True):
+            if not author_name.strip():
+                st.error("Submitted By is required.")
+            elif orders_received <= 0:
+                st.error("Total Orders Received must be greater than 0.")
+            elif estimated_units <= 0:
+                st.error("Estimated Units Received must be greater than 0.")
+            else:
+                rec_id = save_daily_actuals(
+                    receiving_date=receiving_date,
+                    orders_received=int(orders_received),
+                    estimated_units=int(estimated_units),
+                    author_name=author_name,
+                    notes=notes,
+                )
+                st.success(f"✅ Saved daily receiving data (ID: {rec_id})")
+
+        st.markdown("---")
+        st.subheader("Recent Entries")
+
+        recent_start = date.today() - timedelta(days=120)
+        recent_end = date.today()
+        daily_df = fetch_daily_actuals(recent_start, recent_end)
+
+        if daily_df.empty:
+            st.info("No daily receiving entries yet.")
+        else:
+            show_df = daily_df.copy()
+            show_df["receiving_date"] = show_df["receiving_date"].dt.strftime("%m/%d/%Y")
+            show_df["date_entered"] = show_df["date_entered"].dt.strftime("%m/%d/%Y")
+            st.dataframe(
+                show_df[
+                    ["receiving_date", "orders_received", "estimated_units", "author_name", "notes", "date_entered"]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            csv = daily_df.copy()
+            csv["receiving_date"] = csv["receiving_date"].dt.strftime("%Y-%m-%d")
+            st.download_button(
+                label="⬇️ Download Receiving Data (CSV)",
+                data=csv.to_csv(index=False),
+                file_name=f"receiving_daily_actuals_{date.today().strftime('%Y-%m-%d')}.csv",
+                mime="text/csv",
+            )
+
     # -------------------------------------------------------------------------
     # 2) ANALYTICS
     # -------------------------------------------------------------------------
@@ -770,31 +928,80 @@ def main():
             st.warning("No data found for the selected filters.")
             return
 
+        # Baseline receiving totals (entered on "Receiving Data" tab)
+        daily_df = fetch_daily_actuals(start_date, end_date)
+        total_orders = int(daily_df["orders_received"].sum()) if not daily_df.empty else 0
+        total_units = int(daily_df["estimated_units"].sum()) if not daily_df.empty else 0
+
+        # "Units with errors" based on qty_short + qty_heavy (when captured)
+        if lines_f.empty:
+            error_units = 0
+        else:
+            tmp_units = lines_f.copy()
+            tmp_units["qty_short"] = tmp_units["qty_short"].fillna(0)
+            tmp_units["qty_heavy"] = tmp_units["qty_heavy"].fillna(0)
+            error_units = int((tmp_units["qty_short"] + tmp_units["qty_heavy"]).sum())
+
         st.markdown("### Key Metrics")
-        k1, k2, k3, k4 = st.columns(4)
+        k1, k2, k3, k4, k5, k6 = st.columns(6)
+
         with k1:
             st.metric("Total Tags", int(tags_f["id"].nunique()))
         with k2:
             st.metric("Total Lines", int(lines_f["id"].nunique()) if not lines_f.empty else 0)
         with k3:
-            if lines_f.empty:
-                st.metric("Packing Slip Match Rate", "—")
-            else:
-                answered = lines_f[lines_f["vendor_packing_slip_matches"].notna()]
-                if answered.empty:
-                    st.metric("Packing Slip Match Rate", "—")
-                else:
-                    rate = (answered["vendor_packing_slip_matches"] == True).mean() * 100.0
-                    st.metric("Packing Slip Match Rate", f"{rate:.1f}%")
+            st.metric("Orders Received", f"{total_orders:,}" if total_orders else "—")
         with k4:
-            if lines_f.empty:
-                st.metric("Short/Heavy Lines", "0")
+            st.metric("Estimated Units", f"{total_units:,}" if total_units else "—")
+        with k5:
+            st.metric("Error Units (Short+Heavy)", f"{error_units:,}")
+        with k6:
+            if total_units and total_units > 0:
+                st.metric("Error Units Rate", f"{(error_units/total_units)*100.0:.2f}%")
             else:
-                sh = lines_f[lines_f["short_heavy_tag"].notna() & (lines_f["short_heavy_tag"] != "")]
-                st.metric("Short/Heavy Lines", f"{len(sh)}")
+                st.metric("Error Units Rate", "—")
+
 
         st.markdown("---")
 
+
+        # Daily error rate (requires Receiving Data entries)
+        st.markdown("### Daily Error Rate (Short+Heavy Units ÷ Estimated Units)")
+        if daily_df.empty:
+            st.info("No Receiving Data entries found in this date range. Add them on the 📦 Receiving Data tab to compute daily rates.")
+        else:
+            # Error units by day from problem lines (qty_short + qty_heavy)
+            if lines_f.empty:
+                err_by_day = pd.DataFrame({"receiving_date": daily_df["receiving_date"].dt.normalize(), "error_units": 0})
+                err_by_day = err_by_day.groupby("receiving_date", as_index=False).agg(error_units=("error_units", "sum"))
+            else:
+                tmp = lines_f.copy()
+                tmp["receiving_date"] = tmp["date_found"].dt.normalize()
+                tmp["qty_short"] = tmp["qty_short"].fillna(0)
+                tmp["qty_heavy"] = tmp["qty_heavy"].fillna(0)
+                tmp["error_units"] = tmp["qty_short"] + tmp["qty_heavy"]
+                err_by_day = tmp.groupby("receiving_date", as_index=False).agg(error_units=("error_units", "sum"))
+
+            base = daily_df.copy()
+            base["receiving_date"] = base["receiving_date"].dt.normalize()
+
+            merged = base.merge(err_by_day, on="receiving_date", how="left")
+            merged["error_units"] = merged["error_units"].fillna(0).astype(int)
+            merged["error_rate"] = merged.apply(
+                lambda r: (r["error_units"] / r["estimated_units"] * 100.0) if r["estimated_units"] else None,
+                axis=1,
+            )
+
+            fig = px.line(merged, x="receiving_date", y="error_rate", markers=True, title=None)
+            fig.update_layout(
+                xaxis_title="Receiving Date",
+                yaxis_title="Error Rate (%)",
+                hovermode="x unified",
+                margin=dict(l=10, r=10, t=10, b=10),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("---")
         # Monthly buckets
         tags_f["production_month"] = tags_f["date_found"].dt.to_period("M").dt.to_timestamp()
         if not lines_f.empty:
