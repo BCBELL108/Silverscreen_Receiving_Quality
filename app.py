@@ -567,7 +567,6 @@ def main():
 
                         if val == "Short/Heavy":
                             split_short_heavy_into_pair(i)
-                            st.rerun()
 
                     # For paired lines, lock selector to the role (Short or Heavy)
                     if ln.get("pair_group") and ln.get("paired_role") in ("Short", "Heavy"):
