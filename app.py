@@ -879,7 +879,7 @@ def main():
             )
 
     # -------------------------------------------------------------------------
-    # 2) ANALYTICS
+    # 2) ANALYTICS (UPDATED)
     # -------------------------------------------------------------------------
     elif menu == "📊 Analytics":
         st.header("Analytics")
@@ -903,37 +903,38 @@ def main():
         with p2:
             trend_basis = st.selectbox("Trend Basis", ["Total Lines (recommended)", "Total Tags"], key="ana_basis")
 
-        tags, lines = fetch_tags_and_lines(start_date, end_date)
-
-        if tags.empty:
-            st.warning("No data found for this date range.")
-            return
-
-        tags_f = tags.copy()
-        lines_f = lines.copy()
-
-        if team_filter != "-- All --":
-            tags_f = tags_f[tags_f["team_name"] == team_filter]
-            lines_f = lines_f[lines_f["team_name"] == team_filter]
-
-        if cust_filter != "-- All --":
-            tags_f = tags_f[tags_f["customer_name"] == cust_filter]
-            lines_f = lines_f[lines_f["customer_name"] == cust_filter]
-
-        if problem_filter != "-- All --":
-            tags_f = tags_f[tags_f["problem_type"] == problem_filter]
-            lines_f = lines_f[lines_f["problem_type"] == problem_filter]
-
-        if tags_f.empty:
-            st.warning("No data found for the selected filters.")
-            return
-
-        # Baseline receiving totals (entered on "Receiving Data" tab)
+        # ----------------------------
+        # 1) BASELINE FIRST (ALWAYS)
+        # ----------------------------
         daily_df = fetch_daily_actuals(start_date, end_date)
         total_orders = int(daily_df["orders_received"].sum()) if not daily_df.empty else 0
         total_units = int(daily_df["estimated_units"].sum()) if not daily_df.empty else 0
 
-        # "Units with errors" based on qty_short + qty_heavy (when captured)
+        # ----------------------------
+        # 2) THEN LOAD ERROR DATA (MAY BE EMPTY)
+        # ----------------------------
+        tags, lines = fetch_tags_and_lines(start_date, end_date)
+
+        tags_f = tags.copy()
+        lines_f = lines.copy()
+
+        # Apply filters even if empty (safe)
+        if team_filter != "-- All --":
+            tags_f = tags_f[tags_f["team_name"] == team_filter] if not tags_f.empty else tags_f
+            lines_f = lines_f[lines_f["team_name"] == team_filter] if not lines_f.empty else lines_f
+
+        if cust_filter != "-- All --":
+            tags_f = tags_f[tags_f["customer_name"] == cust_filter] if not tags_f.empty else tags_f
+            lines_f = lines_f[lines_f["customer_name"] == cust_filter] if not lines_f.empty else lines_f
+
+        if problem_filter != "-- All --":
+            tags_f = tags_f[tags_f["problem_type"] == problem_filter] if not tags_f.empty else tags_f
+            lines_f = lines_f[lines_f["problem_type"] == problem_filter] if not lines_f.empty else lines_f
+
+        # Orders with error = distinct PO#s in filtered tags
+        orders_with_error = int(tags_f["po_number"].nunique()) if not tags_f.empty else 0
+
+        # Units with errors = sum(qty_short + qty_heavy) in filtered lines
         if lines_f.empty:
             error_units = 0
         else:
@@ -942,82 +943,155 @@ def main():
             tmp_units["qty_heavy"] = tmp_units["qty_heavy"].fillna(0)
             error_units = int((tmp_units["qty_short"] + tmp_units["qty_heavy"]).sum())
 
+        orders_without_error = max(total_orders - orders_with_error, 0)
+        good_units = max(total_units - error_units, 0)
+
+        order_error_rate = (orders_with_error / total_orders * 100.0) if total_orders else None
+        unit_error_rate = (error_units / total_units * 100.0) if total_units else None
+        quality_rate = (100.0 - unit_error_rate) if unit_error_rate is not None else None
+
+        # ----------------------------
+        # KPI METRICS (always show)
+        # ----------------------------
         st.markdown("### Key Metrics")
         k1, k2, k3, k4, k5, k6 = st.columns(6)
 
         with k1:
-            st.metric("Total Tags", int(tags_f["id"].nunique()))
+            st.metric("Total Orders Received", f"{total_orders:,}" if total_orders else "—")
         with k2:
-            st.metric("Total Lines", int(lines_f["id"].nunique()) if not lines_f.empty else 0)
+            st.metric("Orders w/ Error", f"{orders_with_error:,}", f"{order_error_rate:.2f}%" if order_error_rate is not None else "—")
         with k3:
-            st.metric("Orders Received", f"{total_orders:,}" if total_orders else "—")
-        with k4:
             st.metric("Estimated Units", f"{total_units:,}" if total_units else "—")
+        with k4:
+            st.metric("Error Units (Short+Heavy)", f"{error_units:,}", f"{unit_error_rate:.2f}%" if unit_error_rate is not None else "—")
         with k5:
-            st.metric("Error Units (Short+Heavy)", f"{error_units:,}")
+            st.metric("Quality (Units)", f"{quality_rate:.2f}%" if quality_rate is not None else "—")
         with k6:
-            if total_units and total_units > 0:
-                st.metric("Error Units Rate", f"{(error_units/total_units)*100.0:.2f}%")
-            else:
-                st.metric("Error Units Rate", "—")
-
+            st.metric("Total Tags", int(tags_f["id"].nunique()) if not tags_f.empty else 0)
 
         st.markdown("---")
 
-
-        # Daily error rate (requires Receiving Data entries)
-        st.markdown("### Daily Error Rate (Short+Heavy Units ÷ Estimated Units)")
         if daily_df.empty:
-            st.info("No Receiving Data entries found in this date range. Add them on the 📦 Receiving Data tab to compute daily rates.")
+            st.info("No Receiving Data entries found in this date range. Add them on the 📦 Receiving Data tab to compute order/unit rates by day and trend charts.")
         else:
-            # Error units by day from problem lines (qty_short + qty_heavy)
-            if lines_f.empty:
-                err_by_day = pd.DataFrame({"receiving_date": daily_df["receiving_date"].dt.normalize(), "error_units": 0})
-                err_by_day = err_by_day.groupby("receiving_date", as_index=False).agg(error_units=("error_units", "sum"))
-            else:
-                tmp = lines_f.copy()
-                tmp["receiving_date"] = tmp["date_found"].dt.normalize()
-                tmp["qty_short"] = tmp["qty_short"].fillna(0)
-                tmp["qty_heavy"] = tmp["qty_heavy"].fillna(0)
-                tmp["error_units"] = tmp["qty_short"] + tmp["qty_heavy"]
-                err_by_day = tmp.groupby("receiving_date", as_index=False).agg(error_units=("error_units", "sum"))
-
+            # ----------------------------
+            # DAILY ROLLUPS (for charts)
+            # ----------------------------
             base = daily_df.copy()
             base["receiving_date"] = base["receiving_date"].dt.normalize()
 
-            merged = base.merge(err_by_day, on="receiving_date", how="left")
-            merged["error_units"] = merged["error_units"].fillna(0).astype(int)
-            merged["error_rate"] = merged.apply(
-                lambda r: (r["error_units"] / r["estimated_units"] * 100.0) if r["estimated_units"] else None,
-                axis=1,
-            )
+            # Orders w/ error by day (distinct PO per date_found)
+            if tags_f.empty:
+                orders_err_by_day = pd.DataFrame({"receiving_date": base["receiving_date"], "orders_with_error": 0}).groupby("receiving_date", as_index=False).sum()
+            else:
+                tmp_tags = tags_f.copy()
+                tmp_tags["receiving_date"] = tmp_tags["date_found"].dt.normalize()
+                orders_err_by_day = (
+                    tmp_tags.groupby("receiving_date", as_index=False)
+                    .agg(orders_with_error=("po_number", "nunique"))
+                )
 
-            fig = px.line(merged, x="receiving_date", y="error_rate", markers=True, title=None)
-            fig.update_layout(
+            # Error units by day (qty_short + qty_heavy summed)
+            if lines_f.empty:
+                err_units_by_day = pd.DataFrame({"receiving_date": base["receiving_date"], "error_units": 0}).groupby("receiving_date", as_index=False).sum()
+            else:
+                tmp_lines = lines_f.copy()
+                tmp_lines["receiving_date"] = tmp_lines["date_found"].dt.normalize()
+                tmp_lines["qty_short"] = tmp_lines["qty_short"].fillna(0)
+                tmp_lines["qty_heavy"] = tmp_lines["qty_heavy"].fillna(0)
+                tmp_lines["error_units"] = tmp_lines["qty_short"] + tmp_lines["qty_heavy"]
+                err_units_by_day = (
+                    tmp_lines.groupby("receiving_date", as_index=False)
+                    .agg(error_units=("error_units", "sum"))
+                )
+
+            merged = base.merge(orders_err_by_day, on="receiving_date", how="left").merge(err_units_by_day, on="receiving_date", how="left")
+            merged["orders_with_error"] = merged["orders_with_error"].fillna(0).astype(int)
+            merged["error_units"] = merged["error_units"].fillna(0).astype(int)
+
+            merged["orders_without_error"] = (merged["orders_received"] - merged["orders_with_error"]).clip(lower=0)
+            merged["good_units"] = (merged["estimated_units"] - merged["error_units"]).clip(lower=0)
+
+            merged["order_error_rate"] = merged.apply(
+                lambda r: (r["orders_with_error"] / r["orders_received"] * 100.0) if r["orders_received"] else None,
+                axis=1
+            )
+            merged["unit_error_rate"] = merged.apply(
+                lambda r: (r["error_units"] / r["estimated_units"] * 100.0) if r["estimated_units"] else None,
+                axis=1
+            )
+            merged["quality_rate"] = merged["unit_error_rate"].apply(lambda x: (100.0 - x) if x is not None else None)
+
+            # ----------------------------
+            # STACKED BAR: ORDERS (Good vs Error)
+            # ----------------------------
+            st.markdown("### Orders Received (Good vs Error)")
+            fig_orders = go.Figure()
+            fig_orders.add_bar(x=merged["receiving_date"], y=merged["orders_without_error"], name="No Issues")
+            fig_orders.add_bar(x=merged["receiving_date"], y=merged["orders_with_error"], name="With Error")
+            fig_orders.update_layout(
+                barmode="stack",
                 xaxis_title="Receiving Date",
-                yaxis_title="Error Rate (%)",
+                yaxis_title="Orders",
+                hovermode="x unified",
+                margin=dict(l=10, r=10, t=10, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig_orders, use_container_width=True)
+
+            st.markdown("---")
+
+            # ----------------------------
+            # STACKED BAR: UNITS (Good vs Error)
+            # ----------------------------
+            st.markdown("### Units Received (Good vs Error)")
+            fig_units = go.Figure()
+            fig_units.add_bar(x=merged["receiving_date"], y=merged["good_units"], name="Good Units")
+            fig_units.add_bar(x=merged["receiving_date"], y=merged["error_units"], name="Error Units")
+            fig_units.update_layout(
+                barmode="stack",
+                xaxis_title="Receiving Date",
+                yaxis_title="Units",
+                hovermode="x unified",
+                margin=dict(l=10, r=10, t=10, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig_units, use_container_width=True)
+
+            st.markdown("---")
+
+            # ----------------------------
+            # LINE: QUALITY TREND
+            # ----------------------------
+            st.markdown("### Receiving Quality Trend (100% baseline, decreases with unit errors)")
+            fig_q = px.line(merged, x="receiving_date", y="quality_rate", markers=True, title=None)
+            fig_q.update_layout(
+                xaxis_title="Receiving Date",
+                yaxis_title="Quality (%)",
                 hovermode="x unified",
                 margin=dict(l=10, r=10, t=10, b=10),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            fig_q.update_yaxes(range=[0, 100])
+            st.plotly_chart(fig_q, use_container_width=True)
 
         st.markdown("---")
-        # Monthly buckets
-        tags_f["production_month"] = tags_f["date_found"].dt.to_period("M").dt.to_timestamp()
-        if not lines_f.empty:
-            lines_f["production_month"] = lines_f["date_found"].dt.to_period("M").dt.to_timestamp()
 
-        # Trend
-        st.markdown("### Trend Over Time (by Month)")
-        if trend_basis.startswith("Total Tags"):
-            monthly_trend = (
-                tags_f.groupby("production_month", as_index=False)
-                .agg(total=("id", "nunique"))
-                .sort_values("production_month")
-            )
-            y_label = "Total Tags"
+        # ----------------------------
+        # EXISTING CHARTS (keep, but don't "return" on empty)
+        # ----------------------------
+
+        # If no tags after filtering, show baseline message and stop showing issue-only charts
+        if tags_f.empty:
+            st.success("✅ No receiving issues found for the selected date range/filters. Baseline quality is 100%.")
         else:
-            if lines_f.empty:
+            # Monthly buckets
+            tags_f["production_month"] = tags_f["date_found"].dt.to_period("M").dt.to_timestamp()
+            if not lines_f.empty:
+                lines_f["production_month"] = lines_f["date_found"].dt.to_period("M").dt.to_timestamp()
+
+            # Trend
+            st.markdown("### Trend Over Time (by Month)")
+            if trend_basis.startswith("Total Tags"):
                 monthly_trend = (
                     tags_f.groupby("production_month", as_index=False)
                     .agg(total=("id", "nunique"))
@@ -1025,88 +1099,96 @@ def main():
                 )
                 y_label = "Total Tags"
             else:
-                monthly_trend = (
-                    lines_f.groupby("production_month", as_index=False)
-                    .agg(total=("id", "count"))
-                    .sort_values("production_month")
-                )
-                y_label = "Total Lines"
+                if lines_f.empty:
+                    monthly_trend = (
+                        tags_f.groupby("production_month", as_index=False)
+                        .agg(total=("id", "nunique"))
+                        .sort_values("production_month")
+                    )
+                    y_label = "Total Tags"
+                else:
+                    monthly_trend = (
+                        lines_f.groupby("production_month", as_index=False)
+                        .agg(total=("id", "count"))
+                        .sort_values("production_month")
+                    )
+                    y_label = "Total Lines"
 
-        fig = px.line(monthly_trend, x="production_month", y="total", markers=True, title=None)
-        fig.update_layout(
-            xaxis_title="Production Month",
-            yaxis_title=y_label,
-            hovermode="x unified",
-            margin=dict(l=10, r=10, t=10, b=10),
-        )
-        fig.update_xaxes(dtick="M1", tickformat="%b %Y")
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown("---")
-
-        # Shorts vs Heavies stacked
-        st.markdown("### Shorts vs Heavies (Stacked by Month)")
-        if lines_f.empty:
-            st.info("No line-level data available to chart Shorts/Heavies.")
-        else:
-            tmp = lines_f.copy()
-            tmp["short_heavy_norm"] = tmp["short_heavy_tag"].fillna("").astype(str)
-
-            def split_counts(val: str):
-                if val == "Short":
-                    return (1, 0)
-                if val == "Heavy":
-                    return (0, 1)
-                if val == "Short/Heavy":
-                    # should not occur with new rules, but keep safe
-                    return (1, 1)
-                return (0, 0)
-
-            tmp[["short_count", "heavy_count"]] = tmp["short_heavy_norm"].apply(lambda v: pd.Series(split_counts(v)))
-
-            monthly_sh = (
-                tmp.groupby("production_month", as_index=False)
-                .agg(shorts=("short_count", "sum"), heavies=("heavy_count", "sum"))
-                .sort_values("production_month")
-            )
-
-            fig = go.Figure()
-            fig.add_bar(x=monthly_sh["production_month"], y=monthly_sh["shorts"], name="Shorts")
-            fig.add_bar(x=monthly_sh["production_month"], y=monthly_sh["heavies"], name="Heavies")
+            fig = px.line(monthly_trend, x="production_month", y="total", markers=True, title=None)
             fig.update_layout(
-                barmode="stack",
                 xaxis_title="Production Month",
-                yaxis_title="Count of Issues",
+                yaxis_title=y_label,
                 hovermode="x unified",
                 margin=dict(l=10, r=10, t=10, b=10),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             )
             fig.update_xaxes(dtick="M1", tickformat="%b %Y")
             st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown("---")
+            st.markdown("---")
 
-        # Packing slip Yes/No breakdown
-        st.markdown("### Vendor Packing Slip Match (Yes / No)")
-        if lines_f.empty:
-            st.info("No line-level data available to chart packing slip matches.")
-        else:
-            answered = lines_f[lines_f["vendor_packing_slip_matches"].notna()].copy()
-            if answered.empty:
-                st.info("No packing slip responses recorded yet.")
+            # Shorts vs Heavies stacked
+            st.markdown("### Shorts vs Heavies (Stacked by Month)")
+            if lines_f.empty:
+                st.info("No line-level data available to chart Shorts/Heavies.")
             else:
-                answered["match_label"] = answered["vendor_packing_slip_matches"].apply(lambda x: "Yes" if x else "No")
-                counts = answered["match_label"].value_counts().reset_index()
-                counts.columns = ["match_label", "count"]
+                tmp = lines_f.copy()
+                tmp["short_heavy_norm"] = tmp["short_heavy_tag"].fillna("").astype(str)
 
-                fig = px.bar(counts, x="match_label", y="count", title=None)
-                fig.update_layout(
-                    xaxis_title="Packing Slip Matches?",
-                    yaxis_title="Count",
-                    margin=dict(l=10, r=10, t=10, b=10),
-                    showlegend=False,
+                def split_counts(val: str):
+                    if val == "Short":
+                        return (1, 0)
+                    if val == "Heavy":
+                        return (0, 1)
+                    if val == "Short/Heavy":
+                        # should not occur with new rules, but keep safe
+                        return (1, 1)
+                    return (0, 0)
+
+                tmp[["short_count", "heavy_count"]] = tmp["short_heavy_norm"].apply(lambda v: pd.Series(split_counts(v)))
+
+                monthly_sh = (
+                    tmp.groupby("production_month", as_index=False)
+                    .agg(shorts=("short_count", "sum"), heavies=("heavy_count", "sum"))
+                    .sort_values("production_month")
                 )
+
+                fig = go.Figure()
+                fig.add_bar(x=monthly_sh["production_month"], y=monthly_sh["shorts"], name="Shorts")
+                fig.add_bar(x=monthly_sh["production_month"], y=monthly_sh["heavies"], name="Heavies")
+                fig.update_layout(
+                    barmode="stack",
+                    xaxis_title="Production Month",
+                    yaxis_title="Count of Issues",
+                    hovermode="x unified",
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                fig.update_xaxes(dtick="M1", tickformat="%b %Y")
                 st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("---")
+
+            # Packing slip Yes/No breakdown
+            st.markdown("### Vendor Packing Slip Match (Yes / No)")
+            if lines_f.empty:
+                st.info("No line-level data available to chart packing slip matches.")
+            else:
+                answered = lines_f[lines_f["vendor_packing_slip_matches"].notna()].copy()
+                if answered.empty:
+                    st.info("No packing slip responses recorded yet.")
+                else:
+                    answered["match_label"] = answered["vendor_packing_slip_matches"].apply(lambda x: "Yes" if x else "No")
+                    counts = answered["match_label"].value_counts().reset_index()
+                    counts.columns = ["match_label", "count"]
+
+                    fig = px.bar(counts, x="match_label", y="count", title=None)
+                    fig.update_layout(
+                        xaxis_title="Packing Slip Matches?",
+                        yaxis_title="Count",
+                        margin=dict(l=10, r=10, t=10, b=10),
+                        showlegend=False,
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
 
     # -------------------------------------------------------------------------
     # 3) VIEW SUBMISSIONS
