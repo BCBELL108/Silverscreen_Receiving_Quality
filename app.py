@@ -22,190 +22,186 @@ SIZE_OPTIONS = [
     "2T", "3T", "4T", "5/6T",
     "YXS", "YS", "YM", "YL", "YXL",
     "XS", "S", "M", "L", "XL", "2XL", "3XL",
-    "OTHER", "OSFA",
+    "OTHER",
 ]
 
-SHORT_HEAVY_OPTIONS = ["", "Short", "Heavy", "Short/Heavy"]  # optional per-line
-PACKING_SLIP_OPTIONS = ["", "Yes", "No"]  # stored as nullable boolean
+SHORT_HEAVY_OPTIONS = [
+    "",
+    "Short",
+    "Heavy",
+    "Short/Heavy",
+]
 
+# mapping used for main problem type vs lines' short/heavy tag (when the issue is short/heavy)
+SHORT_HEAVY_LINE_PROBLEM_TYPES = [
+    "Short/ Heavy Items",
+]
 
-# =============================================================================
-# DB CONNECTION (Neon via Streamlit Secrets)
-# =============================================================================
+# PRESET COLORS
+COLOR_MATCH_OPTIONS = [
+    "",
+    "Matches Packing Slip",
+    "Does Not Match Packing Slip",
+]
 
+# caching DB URL
 @st.cache_resource
 def get_engine():
-    # Streamlit Secrets must include:
-    # [connections.receiving]
-    # url="postgresql://...."
-    return st.connection("receiving", type="sql").engine
+    from sqlalchemy import create_engine
 
-
-def init_db():
-    """Create tables if they don't exist and seed initial employees."""
-    eng = get_engine()
-    with eng.begin() as conn:
-        # Customers
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS customers (
-                id SERIAL PRIMARY KEY,
-                customer_name TEXT UNIQUE NOT NULL,
-                date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                active INTEGER DEFAULT 1
-            );
-        """))
-
-        # Employees (mistake-made-by)
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS employees (
-                id SERIAL PRIMARY KEY,
-                employee_name TEXT UNIQUE NOT NULL,
-                date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                active INTEGER DEFAULT 1
-            );
-        """))
-
-
-        # Receiving daily actuals (baseline for error rates)
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS receiving_daily_actuals (
-                id SERIAL PRIMARY KEY,
-                date_entered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                receiving_date DATE UNIQUE NOT NULL,
-                orders_received INTEGER NOT NULL,
-                estimated_units INTEGER NOT NULL,
-                author_name TEXT NOT NULL,
-                notes TEXT
-            );
-        """))
-        # Problem tag header (one per submission)
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS receiving_problem_tags (
-                id SERIAL PRIMARY KEY,
-                date_entered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                date_found DATE NOT NULL,
-                po_number TEXT NOT NULL,
-                customer_id INTEGER NOT NULL REFERENCES customers(id),
-                job_name TEXT NOT NULL,
-                team_name TEXT NOT NULL,
-                author_name TEXT NOT NULL,
-                problem_type TEXT NOT NULL,
-                mistake_employee_id INTEGER NULL REFERENCES employees(id),
-                notes TEXT
-            );
-        """))
-
-        # Problem tag lines (one-or-many per header)
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS receiving_problem_lines (
-                id SERIAL PRIMARY KEY,
-                tag_id INTEGER NOT NULL REFERENCES receiving_problem_tags(id) ON DELETE CASCADE,
-                short_heavy_tag TEXT,
-                style_number TEXT NOT NULL,
-                item_description TEXT NOT NULL,
-                color TEXT NOT NULL,
-                size TEXT NOT NULL,
-                vendor_packing_slip_matches BOOLEAN,
-                qty_short INTEGER,
-                qty_heavy INTEGER
-            );
-        """))
-
-    seed_employees()
-
-
-def seed_employees():
-    """Seed the initial list of employees (idempotent)."""
-    initial = [
-        "Joey Quayle",
-        "Izzy Price",
-        "Montana Marsh",
-        "Scott Frank",
-        "Andie Dunsmore",
-        "Jay Lobos",
-        "Randi Robertson",
-        "Yesenia Alcala Villa",
-    ]
-    eng = get_engine()
-    with eng.begin() as conn:
-        for name in initial:
-            conn.execute(
-                text("""
-                    INSERT INTO employees (employee_name)
-                    VALUES (:name)
-                    ON CONFLICT (employee_name) DO NOTHING;
-                """),
-                {"name": name},
-            )
+    # You can change this to your Neon URL
+    db_url = st.secrets["db_url"]
+    engine = create_engine(db_url, pool_pre_ping=True)
+    return engine
 
 
 # =============================================================================
 # DB HELPERS
 # =============================================================================
 
-def get_customers() -> pd.DataFrame:
-    eng = get_engine()
-    with eng.connect() as conn:
-        return pd.read_sql(
-            text("""
-                SELECT id, customer_name
-                FROM customers
-                WHERE active = 1
-                ORDER BY customer_name;
-            """),
-            conn,
-        )
 
-
-def add_customer(customer_name: str) -> None:
-    customer_name = (customer_name or "").strip()
-    if not customer_name:
-        return
+def init_db():
+    """Create tables if they don't already exist."""
     eng = get_engine()
     with eng.begin() as conn:
         conn.execute(
-            text("""
-                INSERT INTO customers (customer_name)
-                VALUES (:n)
-                ON CONFLICT (customer_name) DO NOTHING;
-            """),
-            {"n": customer_name},
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS receiving_customers (
+                    id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    customer_name TEXT NOT NULL UNIQUE
+                )
+                """
+            )
         )
+
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS receiving_employees (
+                    id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    employee_name TEXT NOT NULL UNIQUE
+                )
+                """
+            )
+        )
+
+        # Daily "Receiving Data" baseline
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS receiving_daily_actuals (
+                    id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    receiving_date DATE NOT NULL,
+                    orders_received INTEGER NOT NULL,
+                    estimated_units INTEGER NOT NULL,
+                    author_name TEXT NOT NULL,
+                    notes TEXT,
+                    date_entered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    active INTEGER DEFAULT 1
+                )
+                """
+            )
+        )
+
+        # Problem tags - header
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS receiving_problem_tags (
+                    id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    date_found DATE NOT NULL,
+                    po_number TEXT NOT NULL,
+                    customer_id INTEGER NOT NULL REFERENCES receiving_customers(id),
+                    job_name TEXT NOT NULL,
+                    team_name TEXT NOT NULL,
+                    author_name TEXT NOT NULL,
+                    problem_type TEXT NOT NULL,
+                    mistake_employee_id INTEGER NULL REFERENCES receiving_employees(id),
+                    notes TEXT,
+                    date_entered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    active INTEGER DEFAULT 1
+                )
+                """
+            )
+        )
+
+        # Problem tags - line items
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS receiving_problem_lines (
+                    id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    tag_id INTEGER NOT NULL REFERENCES receiving_problem_tags(id),
+                    short_heavy_tag TEXT,
+                    style_number TEXT NOT NULL,
+                    item_description TEXT NOT NULL,
+                    color TEXT NOT NULL,
+                    size TEXT NOT NULL,
+                    vendor_packing_slip_matches INTEGER,
+                    qty_short INTEGER,
+                    qty_heavy INTEGER
+                )
+                """
+            )
+        )
+
+
+def get_customers() -> pd.DataFrame:
+    eng = get_engine()
+    with eng.connect() as conn:
+        df = pd.read_sql(text("SELECT id, customer_name FROM receiving_customers ORDER BY customer_name"), conn)
+    return df
 
 
 def get_employees() -> pd.DataFrame:
     eng = get_engine()
     with eng.connect() as conn:
-        return pd.read_sql(
-            text("""
-                SELECT id, employee_name
-                FROM employees
-                WHERE active = 1
-                ORDER BY employee_name;
-            """),
-            conn,
-        )
+        df = pd.read_sql(text("SELECT id, employee_name FROM receiving_employees ORDER BY employee_name"), conn)
+    return df
 
 
-def add_employee(employee_name: str) -> None:
-    employee_name = (employee_name or "").strip()
-    if not employee_name:
-        return
+def add_customer_if_needed(name: str) -> int:
+    name = name.strip()
+    if not name:
+        raise ValueError("Customer name cannot be empty.")
     eng = get_engine()
     with eng.begin() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO employees (employee_name)
-                VALUES (:n)
-                ON CONFLICT (employee_name) DO NOTHING;
-            """),
-            {"n": employee_name},
+        result = conn.execute(
+            text(
+                """
+                INSERT INTO receiving_customers (customer_name)
+                VALUES (:name)
+                ON CONFLICT (customer_name) DO UPDATE SET customer_name = EXCLUDED.customer_name
+                RETURNING id
+                """
+            ),
+            {"name": name},
         )
+        cid = result.scalar_one()
+    return cid
 
 
-# =============================================================================
-# RECEIVING DAILY ACTUALS (baseline)
-# =============================================================================
+def add_employee(name: str) -> int:
+    name = name.strip()
+    if not name:
+        raise ValueError("Employee name cannot be empty.")
+    eng = get_engine()
+    with eng.begin() as conn:
+        result = conn.execute(
+            text(
+                """
+                INSERT INTO receiving_employees (employee_name)
+                VALUES (:name)
+                ON CONFLICT (employee_name) DO UPDATE SET employee_name = EXCLUDED.employee_name
+                RETURNING id
+                """
+            ),
+            {"name": name},
+        )
+        eid = result.scalar_one()
+    return eid
+
 
 def save_daily_actuals(
     *,
@@ -213,63 +209,67 @@ def save_daily_actuals(
     orders_received: int,
     estimated_units: int,
     author_name: str,
-    notes: str = "",
+    notes: str | None = None,
 ) -> int:
-    """Upserts one daily record (unique by receiving_date). Returns row id."""
     eng = get_engine()
     with eng.begin() as conn:
-        rec_id = conn.execute(
-            text("""
+        res = conn.execute(
+            text(
+                """
                 INSERT INTO receiving_daily_actuals (
                     receiving_date, orders_received, estimated_units, author_name, notes
                 )
-                VALUES (
-                    :receiving_date, :orders_received, :estimated_units, :author_name, :notes
-                )
-                ON CONFLICT (receiving_date)
-                DO UPDATE SET
-                    orders_received = EXCLUDED.orders_received,
-                    estimated_units = EXCLUDED.estimated_units,
-                    author_name = EXCLUDED.author_name,
-                    notes = EXCLUDED.notes,
-                    date_entered = CURRENT_TIMESTAMP
-                RETURNING id;
-            """),
+                VALUES (:dt, :ord, :est, :auth, :notes)
+                RETURNING id
+                """
+            ),
             {
-                "receiving_date": receiving_date,
-                "orders_received": int(orders_received),
-                "estimated_units": int(estimated_units),
-                "author_name": author_name.strip(),
-                "notes": (notes or "").strip(),
+                "dt": receiving_date,
+                "ord": orders_received,
+                "est": estimated_units,
+                "auth": author_name,
+                "notes": notes,
             },
-        ).scalar_one()
-    return int(rec_id)
+        )
+        return res.scalar_one()
 
 
-def fetch_daily_actuals(start_date: date, end_date: date) -> pd.DataFrame:
+def fetch_daily_actuals(start: date, end: date) -> pd.DataFrame:
     eng = get_engine()
     with eng.connect() as conn:
         df = pd.read_sql(
-            text("""
+            text(
+                """
                 SELECT
                     id,
-                    date_entered,
                     receiving_date,
                     orders_received,
                     estimated_units,
                     author_name,
-                    notes
+                    notes,
+                    date_entered,
+                    active
                 FROM receiving_daily_actuals
-                WHERE receiving_date BETWEEN :sd AND :ed
-                ORDER BY receiving_date ASC;
-            """),
+                WHERE receiving_date BETWEEN :s AND :e
+                ORDER BY receiving_date
+                """
+            ),
             conn,
-            params={"sd": start_date, "ed": end_date},
+            params={"s": start, "e": end},
         )
-    if not df.empty:
-        df["receiving_date"] = pd.to_datetime(df["receiving_date"])
-        df["date_entered"] = pd.to_datetime(df["date_entered"])
+    df["receiving_date"] = pd.to_datetime(df["receiving_date"])
+    df["date_entered"] = pd.to_datetime(df["date_entered"])
     return df
+
+
+def packing_slip_to_bool(val: str | None) -> int | None:
+    if not val:
+        return None
+    if val == "Matches Packing Slip":
+        return 1
+    if val == "Does Not Match Packing Slip":
+        return 0
+    return None
 
 
 def save_problem_tag(
@@ -289,7 +289,8 @@ def save_problem_tag(
     eng = get_engine()
     with eng.begin() as conn:
         tag_id = conn.execute(
-            text("""
+            text(
+                """
                 INSERT INTO receiving_problem_tags (
                     date_found, po_number, customer_id, job_name, team_name,
                     author_name, problem_type, mistake_employee_id, notes
@@ -298,114 +299,130 @@ def save_problem_tag(
                     :date_found, :po_number, :customer_id, :job_name, :team_name,
                     :author_name, :problem_type, :mistake_employee_id, :notes
                 )
-                RETURNING id;
-            """),
+                RETURNING id
+                """
+            ),
             {
                 "date_found": date_found,
-                "po_number": po_number.strip(),
-                "customer_id": int(customer_id),
-                "job_name": job_name.strip(),
+                "po_number": po_number,
+                "customer_id": customer_id,
+                "job_name": job_name,
                 "team_name": team_name,
-                "author_name": author_name.strip(),
+                "author_name": author_name,
                 "problem_type": problem_type,
-                "mistake_employee_id": int(mistake_employee_id) if mistake_employee_id else None,
-                "notes": (notes or "").strip(),
+                "mistake_employee_id": mistake_employee_id,
+                "notes": notes,
             },
         ).scalar_one()
 
         for ln in lines:
             conn.execute(
-                text("""
+                text(
+                    """
                     INSERT INTO receiving_problem_lines (
-                        tag_id, short_heavy_tag, style_number, item_description, color, size,
-                        vendor_packing_slip_matches, qty_short, qty_heavy
+                        tag_id,
+                        short_heavy_tag,
+                        style_number,
+                        item_description,
+                        color,
+                        size,
+                        vendor_packing_slip_matches,
+                        qty_short,
+                        qty_heavy
                     )
                     VALUES (
-                        :tag_id, :short_heavy_tag, :style_number, :item_description, :color, :size,
-                        :vendor_packing_slip_matches, :qty_short, :qty_heavy
-                    );
-                """),
+                        :tag_id,
+                        :short_heavy_tag,
+                        :style_number,
+                        :item_description,
+                        :color,
+                        :size,
+                        :vendor_packing_slip_matches,
+                        :qty_short,
+                        :qty_heavy
+                    )
+                    """
+                ),
                 {
-                    "tag_id": int(tag_id),
-                    "short_heavy_tag": (ln.get("short_heavy_tag") or None),
-                    "style_number": ln["style_number"].strip(),
-                    "item_description": ln["item_description"].strip(),
-                    "color": ln["color"].strip(),
-                    "size": ln["size"],
-                    "vendor_packing_slip_matches": ln.get("vendor_packing_slip_matches", None),
-                    "qty_short": ln.get("qty_short", None),
-                    "qty_heavy": ln.get("qty_heavy", None),
+                    "tag_id": tag_id,
+                    "short_heavy_tag": ln.get("short_heavy_tag"),
+                    "style_number": ln.get("style_number"),
+                    "item_description": ln.get("item_description"),
+                    "color": ln.get("color"),
+                    "size": ln.get("size"),
+                    "vendor_packing_slip_matches": ln.get("vendor_packing_slip_matches"),
+                    "qty_short": ln.get("qty_short"),
+                    "qty_heavy": ln.get("qty_heavy"),
                 },
             )
 
-    return int(tag_id)
+    return tag_id
 
 
-def fetch_tags_and_lines(start_date: date, end_date: date) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Returns (tags_df, lines_df) within date_found range."""
+def fetch_problem_tags_and_lines(
+    start: date, end: date, team_filter: str | None = None, customer_id: int | None = None
+) -> pd.DataFrame:
+    """Return a wide dataframe joining tags + lines for analytics."""
     eng = get_engine()
     with eng.connect() as conn:
-        tags = pd.read_sql(
-            text("""
-                SELECT
-                    t.id,
-                    t.date_entered,
-                    t.date_found,
-                    t.po_number,
-                    c.customer_name,
-                    t.job_name,
-                    t.team_name,
-                    t.author_name,
-                    t.problem_type,
-                    e.employee_name AS mistake_made_by,
-                    t.notes
-                FROM receiving_problem_tags t
-                JOIN customers c ON t.customer_id = c.id
-                LEFT JOIN employees e ON t.mistake_employee_id = e.id
-                WHERE t.date_found BETWEEN :sd AND :ed
-                ORDER BY t.date_found DESC, t.date_entered DESC;
-            """),
-            conn,
-            params={"sd": start_date, "ed": end_date},
-        )
+        base_query = """
+            SELECT
+                t.id AS tag_id,
+                t.date_found,
+                t.po_number,
+                t.job_name,
+                t.team_name,
+                t.author_name,
+                t.problem_type,
+                t.notes,
+                t.date_entered,
+                c.customer_name,
+                e.employee_name AS mistake_made_by,
+                l.id AS line_id,
+                l.short_heavy_tag,
+                l.style_number,
+                l.item_description,
+                l.color,
+                l.size,
+                l.vendor_packing_slip_matches,
+                l.qty_short,
+                l.qty_heavy
+            FROM receiving_problem_tags t
+            JOIN receiving_customers c
+                ON t.customer_id = c.id
+            LEFT JOIN receiving_employees e
+                ON t.mistake_employee_id = e.id
+            LEFT JOIN receiving_problem_lines l
+                ON l.tag_id = t.id
+            WHERE
+                t.date_found BETWEEN :start_date AND :end_date
+                AND t.active = 1
+        """
 
-        lines = pd.read_sql(
-            text("""
-                SELECT
-                    l.*,
-                    t.date_found,
-                    t.team_name,
-                    t.problem_type,
-                    c.customer_name
-                FROM receiving_problem_lines l
-                JOIN receiving_problem_tags t ON l.tag_id = t.id
-                JOIN customers c ON t.customer_id = c.id
-                WHERE t.date_found BETWEEN :sd AND :ed
-                ORDER BY t.date_found DESC, l.id ASC;
-            """),
-            conn,
-            params={"sd": start_date, "ed": end_date},
-        )
+        params: dict = {"start_date": start, "end_date": end}
 
-    if not tags.empty:
-        tags["date_found"] = pd.to_datetime(tags["date_found"])
-        tags["date_entered"] = pd.to_datetime(tags["date_entered"])
-    if not lines.empty:
-        lines["date_found"] = pd.to_datetime(lines["date_found"])
+        if team_filter and team_filter != "-- All --":
+            base_query += " AND t.team_name = :team_name"
+            params["team_name"] = team_filter
 
-    return tags, lines
+        if customer_id is not None:
+            base_query += " AND t.customer_id = :customer_id"
+            params["customer_id"] = customer_id
 
+        base_query += """
+            ORDER BY t.date_found, t.id, l.id
+        """
 
-# =============================================================================
-# UI HELPERS
-# =============================================================================
+        df = pd.read_sql(text(base_query), conn, params=params)
 
-def ensure_line_state():
-    if "lines" not in st.session_state:
-        st.session_state["lines"] = [default_line()]
+    if not df.empty:
+        df["date_found"] = pd.to_datetime(df["date_found"])
+        df["date_entered"] = pd.to_datetime(df["date_entered"])
+    return df
 
 
-def default_line():
+def default_line() -> dict:
+    """Default line dict for the older detailed mode (kept in case you ever want it back)."""
     return {
         "short_heavy_tag": "",
         "style_number": "",
@@ -413,131 +430,45 @@ def default_line():
         "color": "",
         "size": "M",
         "vendor_packing_slip_matches": "",
-        "qty_short": None,
-        "qty_heavy": None,
-
-        # pairing metadata
-        "pair_group": None,   # shared id across pair
-        "paired_role": None,  # "Short" or "Heavy" for paired lines
+        "qty_short": 0,
+        "qty_heavy": 0,
+        # pairing metadata for short/heavy
+        "pair_group": None,
+        "paired_role": None,  # "Short" or "Heavy"
     }
 
 
-def packing_slip_to_bool(val: str):
-    if val == "Yes":
-        return True
-    if val == "No":
-        return False
-    return None
+def ensure_line_state():
+    """Initialize session lines for the old detailed UI (still referenced in a few places)."""
+    if "lines" not in st.session_state:
+        st.session_state["lines"] = [default_line()]
 
 
-def fmt_mmddyyyy(dt_series: pd.Series) -> pd.Series:
-    return pd.to_datetime(dt_series).dt.strftime("%m/%d/%Y")
+def validate_submission(header: dict, total_pieces_with_error: int | None) -> list[str]:
+    """Validate the simplified problem tag submission.
 
+    We now only *require*:
+      - date_found
+      - customer_id
+      - problem_type
+      - total_pieces_with_error (> 0)
 
-def split_short_heavy_into_pair(idx: int):
+    Other fields (PO#, job name, team, author) are optional and will be
+    defaulted before saving so they satisfy the NOT NULL constraints.
     """
-    Converts a single "Short/Heavy" line into two linked lines:
-    - current line becomes "Short"
-    - inserts a new line beneath as "Heavy"
-    Copies shared fields (style/desc/color/packing slip), but size stays editable.
-    """
-    lines = st.session_state["lines"]
-    if idx < 0 or idx >= len(lines):
-        return
+    errors: list[str] = []
 
-    ln = lines[idx]
-
-    # If already paired, don't re-split
-    if ln.get("pair_group"):
-        ln["short_heavy_tag"] = ln.get("paired_role") or "Short"
-        return
-
-    group_id = str(uuid.uuid4())
-
-    # Current line becomes SHORT
-    ln["pair_group"] = group_id
-    ln["paired_role"] = "Short"
-    ln["short_heavy_tag"] = "Short"
-
-    # Insert HEAVY line beneath it
-    new_ln = default_line()
-    new_ln["pair_group"] = group_id
-    new_ln["paired_role"] = "Heavy"
-    new_ln["short_heavy_tag"] = "Heavy"
-
-    # Copy shared fields so user doesn't retype
-    new_ln["style_number"] = ln.get("style_number", "")
-    new_ln["item_description"] = ln.get("item_description", "")
-    new_ln["color"] = ln.get("color", "")
-    new_ln["vendor_packing_slip_matches"] = ln.get("vendor_packing_slip_matches", "")
-
-    # Size stays editable (L vs XL scenario)
-    lines.insert(idx + 1, new_ln)
-
-
-def validate_submission(header: dict, lines: list[dict]) -> list[str]:
-    errors = []
-
-    if not header.get("po_number", "").strip():
-        errors.append("PO# is required.")
-    if not header.get("job_name", "").strip():
-        errors.append("Job Name is required.")
-    if not header.get("author_name", "").strip():
-        errors.append("Author is required.")
-    if not header.get("customer_id"):
-        errors.append("Customer is required.")
-    if not header.get("team_name"):
-        errors.append("Team Name is required.")
-    if not header.get("problem_type"):
-        errors.append("Problem Type is required.")
     if not header.get("date_found"):
         errors.append("Date Found is required.")
 
-    if not lines or len(lines) == 0:
-        errors.append("At least one SKU/problem line is required.")
-        return errors
+    if not header.get("customer_id"):
+        errors.append("Customer is required.")
 
-    # Basic per-line required fields
-    for i, ln in enumerate(lines, start=1):
-        if not (ln.get("style_number", "").strip()):
-            errors.append(f"Line {i}: STYLE# is required.")
-        if not (ln.get("item_description", "").strip()):
-            errors.append(f"Line {i}: ITEM DESCRIPTION is required.")
-        if not (ln.get("color", "").strip()):
-            errors.append(f"Line {i}: COLOR is required.")
-        if ln.get("size") not in SIZE_OPTIONS:
-            errors.append(f"Line {i}: SIZE must be one of the allowed options.")
+    if not header.get("problem_type"):
+        errors.append("Problem Type is required.")
 
-        sh = ln.get("short_heavy_tag") or ""
-        if sh and sh not in SHORT_HEAVY_OPTIONS:
-            errors.append(f"Line {i}: Short/Heavy tag is invalid.")
-
-        for field in ["qty_short", "qty_heavy"]:
-            val = ln.get(field, None)
-            if val is not None and val < 0:
-                errors.append(f"Line {i}: {field} cannot be negative.")
-
-    # Enforce paired completeness: each pair must include Short and Heavy with qtys
-    pairs: dict[str, list[dict]] = {}
-    for ln in lines:
-        pg = ln.get("pair_group")
-        if pg:
-            pairs.setdefault(pg, []).append(ln)
-
-    for pg, group_lines in pairs.items():
-        roles = {g.get("paired_role") for g in group_lines}
-        if roles != {"Short", "Heavy"}:
-            errors.append("A Short/Heavy entry must include BOTH a Short line and a Heavy line.")
-            continue
-
-        short_ln = [g for g in group_lines if g.get("paired_role") == "Short"][0]
-        heavy_ln = [g for g in group_lines if g.get("paired_role") == "Heavy"][0]
-
-        # Require qty > 0 for paired roles
-        if (short_ln.get("qty_short") in (None, 0)):
-            errors.append("Short line requires Qty Short > 0.")
-        if (heavy_ln.get("qty_heavy") in (None, 0)):
-            errors.append("Heavy line requires Qty Heavy > 0.")
+    if total_pieces_with_error is None or total_pieces_with_error <= 0:
+        errors.append("Total pieces with this problem must be greater than 0.")
 
     return errors
 
@@ -545,6 +476,7 @@ def validate_submission(header: dict, lines: list[dict]) -> list[str]:
 # =============================================================================
 # APP
 # =============================================================================
+
 
 def main():
     st.set_page_config(page_title="Receiving KPIs", page_icon="📦", layout="wide")
@@ -555,32 +487,30 @@ def main():
         with eng.connect() as conn:
             conn.execute(text("SELECT 1"))
     except Exception as e:
-        st.error("❌ Database NOT connected (check Streamlit secrets + Neon connection string).")
+        st.error("Could not connect to database. Check secrets['db_url'].")
         st.exception(e)
         return
 
+    # Always ensure tables exist
     init_db()
 
-    # Sidebar (logo like QC dashboard)
+    # Sidebar
     with st.sidebar:
-        try:
-            st.image("silverscreen_logo.png", use_container_width=True)
-        except Exception:
-            st.markdown("### 🎨 SilverScreen")
+        st.title("Receiving KPIs")
+        st.markdown("Use this app to log problems, track daily receiving, and see error rates.")
 
-        st.markdown("---")
-        st.markdown("### Navigation")
         menu = st.radio(
-            "",
+            "Go to:",
             [
                 "📝 Problem Tag Submission",
                 "📦 Receiving Data",
                 "📊 Analytics",
-                "📋 View Submissions",
-                "👥 Manage Lists",
+                "⚙️ Admin",
             ],
-            label_visibility="collapsed",
         )
+
+        st.markdown("---")
+        st.caption("Neon PostgreSQL • Streamlit • Plotly")
 
     # Header / subheader
     st.markdown("<h1 style='text-align:center;'>Receiving KPIs</h1>", unsafe_allow_html=True)
@@ -596,198 +526,115 @@ def main():
     if menu == "📝 Problem Tag Submission":
         st.header("Problem Tag Submission")
 
+        # If we just saved, show a confirmation and clear the form
+        last_id = st.session_state.pop("problem_tag_form_submitted", None)
+        if last_id is not None:
+            st.success(f"✅ Saved Problem Tag (ID: {last_id})")
+
         customers_df = get_customers()
         employees_df = get_employees()
 
         customer_options = ["-- Select Customer --"] + customers_df["customer_name"].tolist()
         employee_options = ["-- Unknown / Not Set --"] + employees_df["employee_name"].tolist()
 
-        c1, c2, c3 = st.columns(3)
+        # --- Core required fields (kept minimal on purpose) ---
+        c1, c2 = st.columns(2)
         with c1:
             date_found = st.date_input("Date Found *", value=date.today(), format="MM/DD/YYYY")
-            po_number = st.text_input("PO# *", placeholder="e.g., PO-12345")
-        with c2:
             customer_name = st.selectbox("Customer Name *", customer_options)
-            job_name = st.text_input("Job Name *", placeholder="e.g., Spring Promo Kit")
-        with c3:
-            team_name = st.selectbox("Team Name *", TEAM_OPTIONS)
-            author_name = st.text_input("Author (who is submitting) *", placeholder="Type name...")
-
-        c4, c5 = st.columns(2)
-        with c4:
+        with c2:
             problem_type = st.selectbox("Problem Type *", PROBLEM_TYPES)
-        with c5:
             mistake_name = st.selectbox("Mistake Made By (optional)", employee_options)
 
-        notes = st.text_area("Notes (optional)", placeholder="Anything helpful about what was found / how it was resolved...")
+        total_pieces_with_error = st.number_input(
+            "Total pieces with this problem *",
+            min_value=1,
+            step=1,
+            key="total_pieces_with_error",
+        )
 
+        # --- Optional extra context (PO, Job, Team, Author, Notes) ---
+        with st.expander("Optional details (PO, Job, Team, Author, Notes)"):
+            c3, c4 = st.columns(2)
+            with c3:
+                po_number = st.text_input("PO# (optional)", placeholder="e.g., PO-12345")
+                job_name = st.text_input("Job Name (optional)", placeholder="e.g., Spring Promo Kit")
+            with c4:
+                team_name = st.selectbox("Team Name (optional)", ["-- Auto: Receiving --"] + TEAM_OPTIONS)
+                author_name = st.text_input("Author (optional)", placeholder="Who is submitting this?")
+
+            notes = st.text_area(
+                "Notes (optional)",
+                placeholder="Anything helpful about what was found / how it was resolved...",
+            )
+
+        # Map friendly names back to ids
         customer_id = None
         if customer_name != "-- Select Customer --":
-            customer_id = int(customers_df.loc[customers_df["customer_name"] == customer_name, "id"].values[0])
+            customer_id = int(
+                customers_df.loc[customers_df["customer_name"] == customer_name, "id"].values[0]
+            )
 
         mistake_employee_id = None
         if mistake_name != "-- Unknown / Not Set --":
-            mistake_employee_id = int(employees_df.loc[employees_df["employee_name"] == mistake_name, "id"].values[0])
+            mistake_employee_id = int(
+                employees_df.loc[employees_df["employee_name"] == mistake_name, "id"].values[0]
+            )
 
-        st.markdown("---")
-        st.subheader("SKU / Problem Lines (add as many as needed)")
+        # Defaults so DB NOT NULL constraints are always satisfied
+        po_number_val = (po_number or "").strip()
+        if not po_number_val:
+            po_number_val = "N/A"
 
-        ensure_line_state()
+        job_name_val = (job_name or "").strip()
+        if not job_name_val:
+            job_name_val = "Quick Entry"
 
-        for idx, ln in enumerate(st.session_state["lines"]):
-            with st.container(border=True):
-                top = st.columns([2, 2, 2, 2, 1])
+        team_name_val = team_name
+        if not team_name_val or team_name_val == "-- Auto: Receiving --":
+            team_name_val = "Receiving"
 
-                # Short/Heavy selector with automatic pairing behavior
-                with top[0]:
-                    sh_key = f"sh_{idx}"
-                    if sh_key not in st.session_state:
-                        st.session_state[sh_key] = ln.get("short_heavy_tag", "")
-
-                    def _on_sh_change(i=idx, key=sh_key):
-                        val = st.session_state[key]
-                        st.session_state["lines"][i]["short_heavy_tag"] = val
-
-                        if val == "Short/Heavy":
-                            split_short_heavy_into_pair(i)
-
-                    # For paired lines, lock selector to the role (Short or Heavy)
-                    if ln.get("pair_group") and ln.get("paired_role") in ("Short", "Heavy"):
-                        st.selectbox(
-                            "Short/Heavy Tag (paired)",
-                            SHORT_HEAVY_OPTIONS,
-                            index=SHORT_HEAVY_OPTIONS.index(ln["paired_role"]),
-                            key=f"sh_lock_{idx}",
-                            disabled=True,
-                        )
-                        ln["short_heavy_tag"] = ln["paired_role"]
-                    else:
-                        ln["short_heavy_tag"] = st.selectbox(
-                            "Short/Heavy Tag (optional)",
-                            SHORT_HEAVY_OPTIONS,
-                            key=sh_key,
-                            on_change=_on_sh_change,
-                        )
-
-                with top[1]:
-                    ln["style_number"] = st.text_input("STYLE# *", value=ln.get("style_number", ""), key=f"style_{idx}")
-                with top[2]:
-                    ln["item_description"] = st.text_input("ITEM DESCRIPTION *", value=ln.get("item_description", ""), key=f"desc_{idx}")
-                with top[3]:
-                    ln["color"] = st.text_input("COLOR *", value=ln.get("color", ""), key=f"color_{idx}")
-                with top[4]:
-                    ln["size"] = st.selectbox(
-                        "SIZE *",
-                        SIZE_OPTIONS,
-                        index=SIZE_OPTIONS.index(ln.get("size", "M")) if ln.get("size", "M") in SIZE_OPTIONS else SIZE_OPTIONS.index("M"),
-                        key=f"size_{idx}",
-                    )
-
-                bottom = st.columns([2, 1, 1, 1])
-                with bottom[0]:
-                    ln["vendor_packing_slip_matches"] = st.selectbox(
-                        "Does vendor packing slip match what we received? (optional)",
-                        PACKING_SLIP_OPTIONS,
-                        index=PACKING_SLIP_OPTIONS.index(ln.get("vendor_packing_slip_matches", "")) if ln.get("vendor_packing_slip_matches", "") in PACKING_SLIP_OPTIONS else 0,
-                        key=f"ps_{idx}",
-                    )
-
-                role = ln.get("paired_role")
-
-                # Qty inputs: role-specific for paired lines
-                with bottom[1]:
-                    if role == "Short":
-                        ln["qty_short"] = st.number_input(
-                            "Qty Short (required)",
-                            min_value=0,
-                            step=1,
-                            value=int(ln["qty_short"]) if ln.get("qty_short") is not None else 0,
-                            key=f"qtys_{idx}",
-                        )
-                    else:
-                        ln["qty_short"] = st.number_input(
-                            "Qty Short (optional)",
-                            min_value=0,
-                            step=1,
-                            value=int(ln["qty_short"]) if ln.get("qty_short") is not None else 0,
-                            key=f"qtys_{idx}",
-                        )
-
-                with bottom[2]:
-                    if role == "Heavy":
-                        ln["qty_heavy"] = st.number_input(
-                            "Qty Heavy (required)",
-                            min_value=0,
-                            step=1,
-                            value=int(ln["qty_heavy"]) if ln.get("qty_heavy") is not None else 0,
-                            key=f"qtyh_{idx}",
-                        )
-                    else:
-                        ln["qty_heavy"] = st.number_input(
-                            "Qty Heavy (optional)",
-                            min_value=0,
-                            step=1,
-                            value=int(ln["qty_heavy"]) if ln.get("qty_heavy") is not None else 0,
-                            key=f"qtyh_{idx}",
-                        )
-
-                with bottom[3]:
-                    # If paired, removing one line only removes that line; (we can add "Remove pair" later if you want)
-                    if st.button("Remove line", key=f"rm_{idx}", use_container_width=True):
-                        st.session_state["lines"].pop(idx)
-                        if len(st.session_state["lines"]) == 0:
-                            st.session_state["lines"] = [default_line()]
-                        st.rerun()
-
-        controls = st.columns([1, 1, 2])
-        with controls[0]:
-            if st.button("➕ Add another line", use_container_width=True):
-                st.session_state["lines"].append(default_line())
-                st.rerun()
-        with controls[1]:
-            if st.button("🧹 Clear lines", use_container_width=True):
-                st.session_state["lines"] = [default_line()]
-                st.rerun()
-
-        st.markdown("---")
+        author_name_val = (author_name or "").strip()
+        if not author_name_val:
+            author_name_val = "Receiving Team"
 
         header = {
             "date_found": date_found,
-            "po_number": po_number,
+            "po_number": po_number_val,
             "customer_id": customer_id,
-            "job_name": job_name,
-            "team_name": team_name,
-            "author_name": author_name,
+            "job_name": job_name_val,
+            "team_name": team_name_val,
+            "author_name": author_name_val,
             "problem_type": problem_type,
             "mistake_employee_id": mistake_employee_id,
             "notes": notes,
         }
 
-        # Normalize line payload (convert UI strings to DB-ready values)
-        lines_payload = []
-        for ln in st.session_state["lines"]:
-            payload = dict(ln)
-
-            payload["vendor_packing_slip_matches"] = packing_slip_to_bool(payload.get("vendor_packing_slip_matches", ""))
-
-            # convert qty 0 => None to reduce noise
-            payload["qty_short"] = None if payload.get("qty_short", 0) == 0 else int(payload["qty_short"])
-            payload["qty_heavy"] = None if payload.get("qty_heavy", 0) == 0 else int(payload["qty_heavy"])
-
-            # do not store pairing metadata in DB
-            payload.pop("pair_group", None)
-            payload.pop("paired_role", None)
-
-            lines_payload.append(payload)
+        # We now store a single generic line where qty_short = total pieces with error.
+        # This feeds the existing analytics (error_units / total_units) without needing SKU-level detail.
+        lines_payload = [
+            {
+                "short_heavy_tag": None,
+                "style_number": "N/A",
+                "item_description": f"Quick entry ({problem_type})",
+                "color": "N/A",
+                "size": "M",
+                "vendor_packing_slip_matches": None,
+                "qty_short": int(total_pieces_with_error) if total_pieces_with_error else None,
+                "qty_heavy": None,
+            }
+        ]
 
         if st.button("💾 Submit Problem Tag", type="primary", use_container_width=True):
-            errs = validate_submission(header, st.session_state["lines"])
+            errs = validate_submission(
+                header,
+                int(total_pieces_with_error) if total_pieces_with_error else None,
+            )
             if errs:
                 st.error("Please fix the following before submitting:")
                 for e in errs:
                     st.write(f"- {e}")
             else:
-                # Validate uses session_state lines (with pair metadata); save uses cleaned payload
                 tag_id = save_problem_tag(
                     date_found=header["date_found"],
                     po_number=header["po_number"],
@@ -800,9 +647,11 @@ def main():
                     notes=header["notes"],
                     lines=lines_payload,
                 )
-                st.success(f"✅ Saved Problem Tag (ID: {tag_id})")
-                st.session_state["lines"] = [default_line()]
-
+                # Flag so we can show success after rerun and give you a clean form
+                st.session_state["problem_tag_form_submitted"] = tag_id
+                # Also reset the pieces field to its minimum on next load
+                st.session_state["total_pieces_with_error"] = 1
+                st.rerun()
 
     # -------------------------------------------------------------------------
     # 2) RECEIVING DATA (DAILY ACTUALS / BASELINE)
@@ -829,7 +678,10 @@ def main():
             estimated_units = st.number_input("Estimated Units Received *", min_value=0, step=1, value=0)
 
         author_name = st.text_input("Submitted By *", placeholder="Type name...")
-        notes = st.text_area("Notes (optional)", placeholder="Anything helpful (carrier delays, partial deliveries, etc.)")
+        notes = st.text_area(
+            "Notes (optional)",
+            placeholder="Anything helpful (carrier delays, partial deliveries, etc.)",
+        )
 
         if st.button("💾 Save Receiving Data", type="primary", use_container_width=True):
             if not author_name.strip():
@@ -863,17 +715,23 @@ def main():
             show_df["date_entered"] = show_df["date_entered"].dt.strftime("%m/%d/%Y")
             st.dataframe(
                 show_df[
-                    ["receiving_date", "orders_received", "estimated_units", "author_name", "notes", "date_entered"]
+                    [
+                        "receiving_date",
+                        "orders_received",
+                        "estimated_units",
+                        "author_name",
+                        "notes",
+                        "date_entered",
+                    ]
                 ],
                 use_container_width=True,
                 hide_index=True,
             )
 
-            csv = daily_df.copy()
-            csv["receiving_date"] = csv["receiving_date"].dt.strftime("%Y-%m-%d")
+            csv = show_df.to_csv(index=False).encode("utf-8")
             st.download_button(
-                label="⬇️ Download Receiving Data (CSV)",
-                data=csv.to_csv(index=False),
+                "⬇️ Download Receiving Data CSV",
+                data=csv,
                 file_name=f"receiving_daily_actuals_{date.today().strftime('%Y-%m-%d')}.csv",
                 mime="text/csv",
             )
@@ -899,360 +757,174 @@ def main():
 
         p1, p2 = st.columns([2, 2])
         with p1:
-            problem_filter = st.selectbox("Problem Type", ["-- All --"] + PROBLEM_TYPES, key="ana_prob")
+            include_unit_detail = st.checkbox(
+                "Show unit-level detail (error units)",
+                value=True,
+                help="If unchecked, metrics focus only on count of problem tags (orders with issues).",
+            )
         with p2:
-            trend_basis = st.selectbox("Trend Basis", ["Total Lines (recommended)", "Total Tags"], key="ana_basis")
+            sort_mode = st.selectbox(
+                "Sort charts by",
+                [
+                    "Highest error rate",
+                    "Most error units",
+                    "Most problem tags",
+                    "Customer name",
+                ],
+            )
 
-        # ----------------------------
-        # 1) BASELINE FIRST (ALWAYS)
-        # ----------------------------
-        daily_df = fetch_daily_actuals(start_date, end_date)
-        total_orders = int(daily_df["orders_received"].sum()) if not daily_df.empty else 0
-        total_units = int(daily_df["estimated_units"].sum()) if not daily_df.empty else 0
-
-        # ----------------------------
-        # 2) THEN LOAD ERROR DATA (MAY BE EMPTY)
-        # ----------------------------
-        tags, lines = fetch_tags_and_lines(start_date, end_date)
-
-        tags_f = tags.copy()
-        lines_f = lines.copy()
-
-        # Apply filters even if empty (safe)
-        if team_filter != "-- All --":
-            tags_f = tags_f[tags_f["team_name"] == team_filter] if not tags_f.empty else tags_f
-            lines_f = lines_f[lines_f["team_name"] == team_filter] if not lines_f.empty else lines_f
-
+        # Map cust_filter back to ID
+        customer_id = None
         if cust_filter != "-- All --":
-            tags_f = tags_f[tags_f["customer_name"] == cust_filter] if not tags_f.empty else tags_f
-            lines_f = lines_f[lines_f["customer_name"] == cust_filter] if not lines_f.empty else lines_f
+            customer_id = int(customers_df.loc[customers_df["customer_name"] == cust_filter, "id"].values[0])
 
-        if problem_filter != "-- All --":
-            tags_f = tags_f[tags_f["problem_type"] == problem_filter] if not tags_f.empty else tags_f
-            lines_f = lines_f[lines_f["problem_type"] == problem_filter] if not lines_f.empty else lines_f
+        # Fetch problem tags + lines
+        problems_df = fetch_problem_tags_and_lines(start_date, end_date, team_filter, customer_id)
+        daily_df = fetch_daily_actuals(start_date, end_date)
 
-        # Orders with error = distinct PO#s in filtered tags
-        orders_with_error = int(tags_f["po_number"].nunique()) if not tags_f.empty else 0
-
-        # Units with errors = sum(qty_short + qty_heavy) in filtered lines
-        if lines_f.empty:
-            error_units = 0
-        else:
-            tmp_units = lines_f.copy()
-            tmp_units["qty_short"] = tmp_units["qty_short"].fillna(0)
-            tmp_units["qty_heavy"] = tmp_units["qty_heavy"].fillna(0)
-            error_units = int((tmp_units["qty_short"] + tmp_units["qty_heavy"]).sum())
-
-        orders_without_error = max(total_orders - orders_with_error, 0)
-        good_units = max(total_units - error_units, 0)
-
-        order_error_rate = (orders_with_error / total_orders * 100.0) if total_orders else None
-        unit_error_rate = (error_units / total_units * 100.0) if total_units else None
-        quality_rate = (100.0 - unit_error_rate) if unit_error_rate is not None else None
-
-        # ----------------------------
-        # KPI METRICS (always show)
-        # ----------------------------
-        st.markdown("### Key Metrics")
-        k1, k2, k3, k4, k5, k6 = st.columns(6)
-
-        with k1:
-            st.metric("Total Orders Received", f"{total_orders:,}" if total_orders else "—")
-        with k2:
-            st.metric("Orders w/ Error", f"{orders_with_error:,}", f"{order_error_rate:.2f}%" if order_error_rate is not None else "—")
-        with k3:
-            st.metric("Estimated Units", f"{total_units:,}" if total_units else "—")
-        with k4:
-            st.metric("Error Units (Short+Heavy)", f"{error_units:,}", f"{unit_error_rate:.2f}%" if unit_error_rate is not None else "—")
-        with k5:
-            st.metric("Quality (Units)", f"{quality_rate:.2f}%" if quality_rate is not None else "—")
-        with k6:
-            st.metric("Total Tags", int(tags_f["id"].nunique()) if not tags_f.empty else 0)
-
-        st.markdown("---")
-
-        if daily_df.empty:
-            st.info("No Receiving Data entries found in this date range. Add them on the 📦 Receiving Data tab to compute order/unit rates by day and trend charts.")
-        else:
-            # ----------------------------
-            # DAILY ROLLUPS (for charts)
-            # ----------------------------
-            base = daily_df.copy()
-            base["receiving_date"] = base["receiving_date"].dt.normalize()
-
-            # Orders w/ error by day (distinct PO per date_found)
-            if tags_f.empty:
-                orders_err_by_day = pd.DataFrame({"receiving_date": base["receiving_date"], "orders_with_error": 0}).groupby("receiving_date", as_index=False).sum()
-            else:
-                tmp_tags = tags_f.copy()
-                tmp_tags["receiving_date"] = tmp_tags["date_found"].dt.normalize()
-                orders_err_by_day = (
-                    tmp_tags.groupby("receiving_date", as_index=False)
-                    .agg(orders_with_error=("po_number", "nunique"))
-                )
-
-            # Error units by day (qty_short + qty_heavy summed)
-            if lines_f.empty:
-                err_units_by_day = pd.DataFrame({"receiving_date": base["receiving_date"], "error_units": 0}).groupby("receiving_date", as_index=False).sum()
-            else:
-                tmp_lines = lines_f.copy()
-                tmp_lines["receiving_date"] = tmp_lines["date_found"].dt.normalize()
-                tmp_lines["qty_short"] = tmp_lines["qty_short"].fillna(0)
-                tmp_lines["qty_heavy"] = tmp_lines["qty_heavy"].fillna(0)
-                tmp_lines["error_units"] = tmp_lines["qty_short"] + tmp_lines["qty_heavy"]
-                err_units_by_day = (
-                    tmp_lines.groupby("receiving_date", as_index=False)
-                    .agg(error_units=("error_units", "sum"))
-                )
-
-            merged = base.merge(orders_err_by_day, on="receiving_date", how="left").merge(err_units_by_day, on="receiving_date", how="left")
-            merged["orders_with_error"] = merged["orders_with_error"].fillna(0).astype(int)
-            merged["error_units"] = merged["error_units"].fillna(0).astype(int)
-
-            merged["orders_without_error"] = (merged["orders_received"] - merged["orders_with_error"]).clip(lower=0)
-            merged["good_units"] = (merged["estimated_units"] - merged["error_units"]).clip(lower=0)
-
-            merged["order_error_rate"] = merged.apply(
-                lambda r: (r["orders_with_error"] / r["orders_received"] * 100.0) if r["orders_received"] else None,
-                axis=1
-            )
-            merged["unit_error_rate"] = merged.apply(
-                lambda r: (r["error_units"] / r["estimated_units"] * 100.0) if r["estimated_units"] else None,
-                axis=1
-            )
-            merged["quality_rate"] = merged["unit_error_rate"].apply(lambda x: (100.0 - x) if x is not None else None)
-
-            # ----------------------------
-            # STACKED BAR: ORDERS (Good vs Error)
-            # ----------------------------
-            st.markdown("### Orders Received (Good vs Error)")
-            fig_orders = go.Figure()
-            fig_orders.add_bar(x=merged["receiving_date"], y=merged["orders_without_error"], name="No Issues")
-            fig_orders.add_bar(x=merged["receiving_date"], y=merged["orders_with_error"], name="With Error")
-            fig_orders.update_layout(
-                barmode="stack",
-                xaxis_title="Receiving Date",
-                yaxis_title="Orders",
-                hovermode="x unified",
-                margin=dict(l=10, r=10, t=10, b=10),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            )
-            st.plotly_chart(fig_orders, use_container_width=True)
-
-            st.markdown("---")
-
-            # ----------------------------
-            # STACKED BAR: UNITS (Good vs Error)
-            # ----------------------------
-            st.markdown("### Units Received (Good vs Error)")
-            fig_units = go.Figure()
-            fig_units.add_bar(x=merged["receiving_date"], y=merged["good_units"], name="Good Units")
-            fig_units.add_bar(x=merged["receiving_date"], y=merged["error_units"], name="Error Units")
-            fig_units.update_layout(
-                barmode="stack",
-                xaxis_title="Receiving Date",
-                yaxis_title="Units",
-                hovermode="x unified",
-                margin=dict(l=10, r=10, t=10, b=10),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            )
-            st.plotly_chart(fig_units, use_container_width=True)
-
-            st.markdown("---")
-
-            # ----------------------------
-            # LINE: QUALITY TREND
-            # ----------------------------
-            st.markdown("### Receiving Quality Trend (100% baseline, decreases with unit errors)")
-            fig_q = px.line(merged, x="receiving_date", y="quality_rate", markers=True, title=None)
-            fig_q.update_layout(
-                xaxis_title="Receiving Date",
-                yaxis_title="Quality (%)",
-                hovermode="x unified",
-                margin=dict(l=10, r=10, t=10, b=10),
-            )
-            fig_q.update_yaxes(range=[0, 100])
-            st.plotly_chart(fig_q, use_container_width=True)
-
-        st.markdown("---")
-
-        # ----------------------------
-        # EXISTING CHARTS (keep, but don't "return" on empty)
-        # ----------------------------
-
-        # If no tags after filtering, show baseline message and stop showing issue-only charts
-        if tags_f.empty:
-            st.success("✅ No receiving issues found for the selected date range/filters. Baseline quality is 100%.")
-        else:
-            # Monthly buckets
-            tags_f["production_month"] = tags_f["date_found"].dt.to_period("M").dt.to_timestamp()
-            if not lines_f.empty:
-                lines_f["production_month"] = lines_f["date_found"].dt.to_period("M").dt.to_timestamp()
-
-            # Trend
-            st.markdown("### Trend Over Time (by Month)")
-            if trend_basis.startswith("Total Tags"):
-                monthly_trend = (
-                    tags_f.groupby("production_month", as_index=False)
-                    .agg(total=("id", "nunique"))
-                    .sort_values("production_month")
-                )
-                y_label = "Total Tags"
-            else:
-                if lines_f.empty:
-                    monthly_trend = (
-                        tags_f.groupby("production_month", as_index=False)
-                        .agg(total=("id", "nunique"))
-                        .sort_values("production_month")
-                    )
-                    y_label = "Total Tags"
-                else:
-                    monthly_trend = (
-                        lines_f.groupby("production_month", as_index=False)
-                        .agg(total=("id", "count"))
-                        .sort_values("production_month")
-                    )
-                    y_label = "Total Lines"
-
-            fig = px.line(monthly_trend, x="production_month", y="total", markers=True, title=None)
-            fig.update_layout(
-                xaxis_title="Production Month",
-                yaxis_title=y_label,
-                hovermode="x unified",
-                margin=dict(l=10, r=10, t=10, b=10),
-            )
-            fig.update_xaxes(dtick="M1", tickformat="%b %Y")
-            st.plotly_chart(fig, use_container_width=True)
-
-            st.markdown("---")
-
-            # Shorts vs Heavies stacked
-            st.markdown("### Shorts vs Heavies (Stacked by Month)")
-            if lines_f.empty:
-                st.info("No line-level data available to chart Shorts/Heavies.")
-            else:
-                tmp = lines_f.copy()
-                tmp["short_heavy_norm"] = tmp["short_heavy_tag"].fillna("").astype(str)
-
-                def split_counts(val: str):
-                    if val == "Short":
-                        return (1, 0)
-                    if val == "Heavy":
-                        return (0, 1)
-                    if val == "Short/Heavy":
-                        # should not occur with new rules, but keep safe
-                        return (1, 1)
-                    return (0, 0)
-
-                tmp[["short_count", "heavy_count"]] = tmp["short_heavy_norm"].apply(lambda v: pd.Series(split_counts(v)))
-
-                monthly_sh = (
-                    tmp.groupby("production_month", as_index=False)
-                    .agg(shorts=("short_count", "sum"), heavies=("heavy_count", "sum"))
-                    .sort_values("production_month")
-                )
-
-                fig = go.Figure()
-                fig.add_bar(x=monthly_sh["production_month"], y=monthly_sh["shorts"], name="Shorts")
-                fig.add_bar(x=monthly_sh["production_month"], y=monthly_sh["heavies"], name="Heavies")
-                fig.update_layout(
-                    barmode="stack",
-                    xaxis_title="Production Month",
-                    yaxis_title="Count of Issues",
-                    hovermode="x unified",
-                    margin=dict(l=10, r=10, t=10, b=10),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                )
-                fig.update_xaxes(dtick="M1", tickformat="%b %Y")
-                st.plotly_chart(fig, use_container_width=True)
-
-            st.markdown("---")
-
-            # Packing slip Yes/No breakdown
-            st.markdown("### Vendor Packing Slip Match (Yes / No)")
-            if lines_f.empty:
-                st.info("No line-level data available to chart packing slip matches.")
-            else:
-                answered = lines_f[lines_f["vendor_packing_slip_matches"].notna()].copy()
-                if answered.empty:
-                    st.info("No packing slip responses recorded yet.")
-                else:
-                    answered["match_label"] = answered["vendor_packing_slip_matches"].apply(lambda x: "Yes" if x else "No")
-                    counts = answered["match_label"].value_counts().reset_index()
-                    counts.columns = ["match_label", "count"]
-
-                    fig = px.bar(counts, x="match_label", y="count", title=None)
-                    fig.update_layout(
-                        xaxis_title="Packing Slip Matches?",
-                        yaxis_title="Count",
-                        margin=dict(l=10, r=10, t=10, b=10),
-                        showlegend=False,
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-
-    # -------------------------------------------------------------------------
-    # 3) VIEW SUBMISSIONS
-    # -------------------------------------------------------------------------
-    elif menu == "📋 View Submissions":
-        st.header("View Submissions")
-
-        sd, ed = st.columns(2)
-        with sd:
-            start_date = st.date_input("Start Date", value=date.today() - timedelta(days=365), format="MM/DD/YYYY", key="view_sd")
-        with ed:
-            end_date = st.date_input("End Date", value=date.today(), format="MM/DD/YYYY", key="view_ed")
-
-        tags, _ = fetch_tags_and_lines(start_date, end_date)
-
-        if tags.empty:
-            st.info("No submissions yet for this date range.")
+        if problems_df.empty and daily_df.empty:
+            st.info("No data found in this date range.")
             return
 
-        display_tags = tags.copy()
-        display_tags["date_found"] = fmt_mmddyyyy(display_tags["date_found"])
-        display_tags["date_entered"] = fmt_mmddyyyy(display_tags["date_entered"])
-
-        st.dataframe(display_tags, use_container_width=True, hide_index=True)
-
-        st.markdown("---")
-        st.subheader("View Lines for a Submission")
-
-        tag_id = st.number_input("Enter Tag ID", min_value=1, step=1, value=int(display_tags.iloc[0]["id"]))
-        eng = get_engine()
-        with eng.connect() as conn:
-            lines = pd.read_sql(
-                text("""
-                    SELECT
-                        id,
-                        short_heavy_tag,
-                        style_number,
-                        item_description,
-                        color,
-                        size,
-                        vendor_packing_slip_matches,
-                        qty_short,
-                        qty_heavy
-                    FROM receiving_problem_lines
-                    WHERE tag_id = :tid
-                    ORDER BY id ASC;
-                """),
-                conn,
-                params={"tid": int(tag_id)},
+        # ---------------------------------------------------------------------
+        # Compute baseline: daily total units
+        # ---------------------------------------------------------------------
+        if daily_df.empty:
+            daily_units = pd.DataFrame(columns=["receiving_date", "total_units"])
+        else:
+            daily_units = (
+                daily_df.groupby("receiving_date", as_index=False)["estimated_units"]
+                .sum()
+                .rename(columns={"receiving_date": "date_found", "estimated_units": "total_units"})
             )
 
-        if not lines.empty:
-            lines["vendor_packing_slip_matches"] = lines["vendor_packing_slip_matches"].apply(
-                lambda x: "Yes" if x is True else ("No" if x is False else "")
+        # ---------------------------------------------------------------------
+        # Compute problem metrics
+        # ---------------------------------------------------------------------
+        if problems_df.empty:
+            st.warning("No problem tags found in this date range.")
+            return
+
+        # Error units (for you now: this is literally the sum of 'total pieces with this problem' we captured as qty_short)
+        problems_df["error_units"] = problems_df[["qty_short", "qty_heavy"]].fillna(0).sum(axis=1)
+
+        # One row per tag to count "orders with issues"
+        tag_level = (
+            problems_df.groupby(
+                ["tag_id", "date_found", "customer_name", "team_name", "problem_type"],
+                as_index=False,
             )
-        st.dataframe(lines, use_container_width=True, hide_index=True)
+            .agg(
+                error_units=("error_units", "sum"),
+            )
+        )
+
+        # Merge with baseline daily units to get error rate
+        tag_level = tag_level.merge(daily_units, on="date_found", how="left")
+        tag_level["total_units"] = tag_level["total_units"].fillna(0)
+
+        tag_level["orders_with_issue"] = 1
+        tag_level["error_rate"] = tag_level.apply(
+            lambda row: (row["error_units"] / row["total_units"]) if row["total_units"] > 0 else 0.0,
+            axis=1,
+        )
+
+        # Aggregate by customer
+        cust_agg = (
+            tag_level.groupby("customer_name", as_index=False)
+            .agg(
+                orders_with_issue=("orders_with_issue", "sum"),
+                error_units=("error_units", "sum"),
+                total_units=("total_units", "sum"),
+            )
+        )
+        cust_agg["error_rate"] = cust_agg.apply(
+            lambda row: (row["error_units"] / row["total_units"]) if row["total_units"] > 0 else 0.0,
+            axis=1,
+        )
+
+        # For charts
+        if sort_mode == "Highest error rate":
+            cust_agg = cust_agg.sort_values("error_rate", ascending=False)
+        elif sort_mode == "Most error units":
+            cust_agg = cust_agg.sort_values("error_units", ascending=False)
+        elif sort_mode == "Most problem tags":
+            cust_agg = cust_agg.sort_values("orders_with_issue", ascending=False)
+        elif sort_mode == "Customer name":
+            cust_agg = cust_agg.sort_values("customer_name", ascending=True)
+
+        # ---------------------------------------------------------------------
+        # Charts
+        # ---------------------------------------------------------------------
+        st.subheader("Customer Error Overview")
+
+        metric_cols = st.columns(4)
+        with metric_cols[0]:
+            total_orders_with_issues = int(tag_level["orders_with_issue"].sum())
+            st.metric("Orders with Issues (tags)", f"{total_orders_with_issues:,}")
+        with metric_cols[1]:
+            total_error_units = int(tag_level["error_units"].sum())
+            st.metric("Error Units (pieces in problem orders)", f"{total_error_units:,}")
+        with metric_cols[2]:
+            total_units_overall = int(daily_units["total_units"].sum())
+            st.metric("Total Units Received", f"{total_units_overall:,}")
+        with metric_cols[3]:
+            if total_units_overall > 0:
+                overall_error_rate = total_error_units / total_units_overall
+            else:
+                overall_error_rate = 0.0
+            st.metric("Overall Error Rate", f"{overall_error_rate:.2%}")
+
+        if not cust_agg.empty:
+            fig1 = px.bar(
+                cust_agg,
+                x="customer_name",
+                y="error_rate",
+                title="Error Rate by Customer (error units / total units received)",
+                labels={"customer_name": "Customer", "error_rate": "Error Rate"},
+            )
+            fig1.update_layout(xaxis_tickangle=-45)
+            st.plotly_chart(fig1, use_container_width=True)
+
+            fig2 = px.bar(
+                cust_agg,
+                x="customer_name",
+                y="error_units",
+                title="Error Units by Customer (pieces in problem orders)",
+                labels={"customer_name": "Customer", "error_units": "Error Units"},
+            )
+            fig2.update_layout(xaxis_tickangle=-45)
+            st.plotly_chart(fig2, use_container_width=True)
+
+        # ---------------------------------------------------------------------
+        # Detailed table
+        # ---------------------------------------------------------------------
+        st.subheader("Tag-Level Detail (Orders with Issues)")
+
+        detail_df = tag_level[
+            [
+                "date_found",
+                "customer_name",
+                "team_name",
+                "problem_type",
+                "orders_with_issue",
+                "error_units",
+                "total_units",
+                "error_rate",
+            ]
+        ].copy()
+        detail_df["date_found"] = detail_df["date_found"].dt.strftime("%m/%d/%Y")
+        detail_df["error_rate"] = (detail_df["error_rate"] * 100).round(2).astype(str) + "%"
+
+        st.dataframe(detail_df, use_container_width=True, hide_index=True)
 
     # -------------------------------------------------------------------------
-    # 4) MANAGE LISTS
+    # 4) ADMIN (CUSTOMERS, EMPLOYEES)
     # -------------------------------------------------------------------------
-    elif menu == "👥 Manage Lists":
-        st.header("Manage Lists")
+    elif menu == "⚙️ Admin":
+        st.header("Admin")
 
-        tab1, tab2 = st.tabs(["🏢 Customers", "👤 Employees"])
+        tab1, tab2 = st.tabs(["Customers", "Employees"])
 
         with tab1:
             st.subheader("Customers")
@@ -1261,8 +933,8 @@ def main():
 
             new_cust = st.text_input("Add new customer", placeholder="Type customer name…")
             if st.button("➕ Add Customer", use_container_width=True):
-                add_customer(new_cust)
-                st.success("Saved (or already existed).")
+                cid = add_customer_if_needed(new_cust)
+                st.success(f"Saved (or already existed). ID = {cid}")
                 st.rerun()
 
         with tab2:
